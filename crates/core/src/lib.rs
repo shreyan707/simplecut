@@ -6,10 +6,16 @@
 
 mod editor;
 mod error;
+mod player;
+mod renderer;
+mod snapshot;
 mod view;
 
 pub use editor::{Edge, Editor, ItemId, Lane, PlaceAt, TrimMode};
 pub use error::{EditorError, Result};
+pub use player::{AudioOutput, FillFn, PlayState, Player};
+pub use renderer::{PreviewRenderer, RenderedFrame};
+pub use snapshot::{PreviewFrame, Snapshot};
 pub use view::{ClipView, ImportReport, MediaEntry, SequenceView, TrackView};
 
 pub use filmcraft_media::MediaKind;
