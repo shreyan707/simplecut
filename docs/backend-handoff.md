@@ -163,8 +163,11 @@ Example: `docs/examples/retake-labels.json`.
   pairs**: the service must not override them.
 - `skipped`: pairs the user left to the model. Decide them with the cross-encoder as usual.
 - `source` is always `"user"`.
-- **Open design question for the backend owner:** whether the labels are fixed edges plus re-scoring of
-  the rest, or the model adapts. The editor does not depend on the answer.
+- **Decided (option 1):** the user's labels are fixed edges for exactly those pairs (`retake` = score 1.0,
+  `different` = 0.0, whatever the model said). The model is **not** adapted during a session and answers
+  never change pairs the user did not answer. Every other pair keeps the cross-encoder's own score, then
+  clustering runs over the edges. The answers are saved (`labels.jsonl`, `source: "user"`) so the model can
+  be retrained offline later.
 
 ### 4.3 Groups (`"stage": "groups"`)
 Example: `docs/examples/retake-groups.json` (6 groups).
