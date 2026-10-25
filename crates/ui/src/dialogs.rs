@@ -10,6 +10,10 @@ pub trait Dialogs {
     fn pick_project_to_open(&self) -> Option<PathBuf>;
     /// Choose where to save the project; `suggested_name` is a file name to offer.
     fn pick_project_save_path(&self, suggested_name: &str) -> Option<PathBuf>;
+    /// Choose where to export video; `suggested_name` is a file name to offer.
+    fn pick_export_path(&self, suggested_name: &str) -> Option<PathBuf>;
+    /// Open the system file browser showing the given file/folder.
+    fn open_folder(&self, path: &std::path::Path);
 }
 
 /// Dialogs that are always cancelled.
@@ -27,4 +31,10 @@ impl Dialogs for NoDialogs {
     fn pick_project_save_path(&self, _suggested_name: &str) -> Option<PathBuf> {
         None
     }
+
+    fn pick_export_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn open_folder(&self, _path: &std::path::Path) {}
 }

@@ -18,6 +18,8 @@ pub struct Script {
     pub media: Arc<Mutex<VecDeque<Vec<PathBuf>>>>,
     pub open: Arc<Mutex<VecDeque<PathBuf>>>,
     pub save: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub export: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub opened_folders: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Dialogs for Script {
@@ -31,6 +33,14 @@ impl Dialogs for Script {
 
     fn pick_project_save_path(&self, _suggested_name: &str) -> Option<PathBuf> {
         self.save.lock().unwrap().pop_front()
+    }
+
+    fn pick_export_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        self.export.lock().unwrap().pop_front()
+    }
+
+    fn open_folder(&self, path: &std::path::Path) {
+        self.opened_folders.lock().unwrap().push(path.to_path_buf());
     }
 }
 

@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use egui::{Align2, Key, Modifiers};
+use egui::{Align2, Key, Modifiers, RichText};
 use simplecut_core::{
-    AudioOutput, ClipId, Edge, Editor, EditorError, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player, PreviewFrame, PreviewRenderer, Snapshot,
-    Target, Thumbnails, Tick, TrackId, TrimMode,
+    AudioOutput, ClipId, Edge, Editor, EditorError, ExportJob, ExportOptions, ExportState, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player,
+    PreviewFrame, PreviewRenderer, Snapshot, Target, Thumbnails, Tick, TrackId, TrimMode,
 };
 
 use crate::dialogs::Dialogs;
@@ -77,6 +77,13 @@ pub enum Action {
     ZoomOut,
     ZoomFit,
     DismissBanner,
+    OpenExportDialog,
+    StartExport {
+        path: PathBuf,
+        use_hardware: bool,
+    },
+    CancelExport,
+    OpenFolder(PathBuf),
 }
 
 /// A line of feedback under the work area.
@@ -84,6 +91,7 @@ pub enum Action {
 pub struct Banner {
     pub text: String,
     pub error: bool,
+    pub action: Option<(String, Action)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,8 +102,16 @@ enum Then {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ExportModalState {
+    pub path: PathBuf,
+    pub use_hardware: bool,
+    pub overwrite_confirm: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Modal {
     Unsaved(Then),
+    Export(ExportModalState),
 }
 
 /// A library thumbnail.
@@ -135,6 +151,7 @@ pub struct SimpleCutApp {
     pub(crate) tl: TimelineUi,
     pub(crate) banner: Option<Banner>,
     modal: Option<Modal>,
+    pub(crate) active_export: Option<ExportJob>,
     close_now: bool,
     title: String,
     queue: Vec<Action>,
@@ -147,7 +164,7 @@ impl SimpleCutApp {
         let mut editor = Editor::new();
         let mut banner = None;
         if let Err(e) = editor.new_project("Untitled") {
-            banner = Some(Banner { text: format!("Could not start a new project: {e}"), error: true });
+            banner = Some(Banner { text: format!("Could not start a new project: {e}"), error: true, action: None });
         }
         Self {
             editor,
@@ -165,6 +182,7 @@ impl SimpleCutApp {
             tl: TimelineUi::default(),
             banner,
             modal: None,
+            active_export: None,
             close_now: false,
             title: String::new(),
             queue: Vec::new(),
@@ -198,9 +216,13 @@ impl SimpleCutApp {
         self.preview_texture.as_ref().map(|t| t.size())
     }
 
-    /// Whether an "unsaved changes" question is waiting for an answer.
     pub fn asking_about_unsaved(&self) -> bool {
-        self.modal.is_some()
+        matches!(self.modal, Some(Modal::Unsaved(_)))
+    }
+
+    /// Whether an export is currently being encoded.
+    pub fn is_exporting(&self) -> bool {
+        self.active_export.is_some()
     }
 
     /// The thumbnail state of a library item: 'pending', 'none' or 'ready'.
@@ -233,11 +255,11 @@ impl SimpleCutApp {
     // ── actions ────────────────────────────────────────────────────────────
 
     fn info(&mut self, text: impl Into<String>) {
-        self.banner = Some(Banner { text: text.into(), error: false });
+        self.banner = Some(Banner { text: text.into(), error: false, action: None });
     }
 
     fn fail(&mut self, e: &EditorError) {
-        self.banner = Some(Banner { text: e.to_string(), error: true });
+        self.banner = Some(Banner { text: e.to_string(), error: true, action: None });
     }
 
     /// Show an error if there is one; otherwise hand the value back.
@@ -364,6 +386,44 @@ impl SimpleCutApp {
             Action::ZoomOut => timeline::zoom_by(self, 1.0 / 1.5),
             Action::ZoomFit => timeline::zoom_fit(self),
             Action::DismissBanner => self.banner = None,
+            Action::OpenExportDialog => self.open_export_dialog(),
+            Action::StartExport { path, use_hardware } => self.start_export(path, use_hardware),
+            Action::CancelExport => self.cancel_export(),
+            Action::OpenFolder(path) => self.dialogs.open_folder(&path),
+        }
+    }
+
+    fn open_export_dialog(&mut self) {
+        if self.active_export.is_some() {
+            return;
+        }
+        let _seq = match self.editor.sequence() {
+            Some(s) if s.clip_count() > 0 && s.duration > Tick::ZERO => s,
+            _ => {
+                self.fail(&EditorError::Invalid("The timeline is empty. Add media to the timeline before exporting.".into()));
+                return;
+            }
+        };
+        let default_name = format!("{}.mp4", self.editor.project_name());
+        let default_path = if let Some(p) = self.editor.project_path() { PathBuf::from(p).with_file_name(default_name) } else { PathBuf::from(default_name) };
+        self.modal = Some(Modal::Export(ExportModalState { path: default_path, use_hardware: false, overwrite_confirm: false }));
+    }
+
+    fn start_export(&mut self, path: PathBuf, use_hardware: bool) {
+        if self.player.is_playing() {
+            self.player.pause();
+        }
+        let r = self.editor.start_export(ExportOptions { path, preset: "YouTube 1080p Full HD".into(), use_hardware });
+        if let Some(job) = self.check(r) {
+            self.active_export = Some(job);
+        }
+    }
+
+    fn cancel_export(&mut self) {
+        if let Some(job) = &self.active_export {
+            job.cancel();
+            self.info("Export cancelled.");
+            self.active_export = None;
         }
     }
 
@@ -414,7 +474,8 @@ impl SimpleCutApp {
                 if report.failed.is_empty() {
                     self.info(if n == 1 { "Imported 1 file.".to_string() } else { format!("Imported {n} files.") });
                 } else {
-                    self.banner = Some(Banner { text: format!("Imported {n}, but some could not be used: {}", report.failed.join("; ")), error: true });
+                    self.banner =
+                        Some(Banner { text: format!("Imported {n}, but some could not be used: {}", report.failed.join("; ")), error: true, action: None });
                 }
                 if first_project_media && let Some(first) = report.imported.first() {
                     self.source = Source::Media(*first);
@@ -527,6 +588,10 @@ impl SimpleCutApp {
 
     /// Forget everything tied to the old project's item ids.
     fn reset_views(&mut self) {
+        if let Some(job) = &self.active_export {
+            job.cancel();
+        }
+        self.active_export = None;
         self.player.pause();
         self.source = Source::Timeline;
         self.media_time = Tick::ZERO;
@@ -585,8 +650,10 @@ impl SimpleCutApp {
 
     // ── the frame ──────────────────────────────────────────────────────────
 
-    /// Everything that happens between drawing frames: the clock, thumbnails and preview pictures.
+    /// Everything that happens between drawing frames: the clock, thumbnails, preview pictures, and background jobs.
     fn pump(&mut self, ctx: &egui::Context) {
+        self.editor.session_mut().poll_persistence();
+
         let state = self.player.tick(&mut self.editor);
         if matches!(self.player.target(), Some(Target::Media(_))) && matches!(self.source, Source::Media(_)) {
             self.media_time = self.player.position();
@@ -622,7 +689,39 @@ impl SimpleCutApp {
             }
         }
 
-        let busy = self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle();
+        // active export job
+        if let Some(job) = &self.active_export {
+            ctx.request_repaint_after(Duration::from_millis(16));
+            match job.poll() {
+                ExportState::Running { .. } => {}
+                ExportState::Done { path, .. } => {
+                    match job.verify() {
+                        Ok(_entry) => {
+                            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "video".into());
+                            self.banner = Some(Banner {
+                                text: format!("Export finished: {name}"),
+                                error: false,
+                                action: Some(("Open folder".into(), Action::OpenFolder(path.clone()))),
+                            });
+                        }
+                        Err(e) => {
+                            self.banner = Some(Banner { text: format!("Export verification failed: {e}"), error: true, action: None });
+                        }
+                    }
+                    self.active_export = None;
+                }
+                ExportState::Cancelled => {
+                    self.info("Export cancelled.");
+                    self.active_export = None;
+                }
+                ExportState::Failed(err) => {
+                    self.banner = Some(Banner { text: format!("Export failed: {err}"), error: true, action: None });
+                    self.active_export = None;
+                }
+            }
+        }
+
+        let busy = self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle() || self.active_export.is_some();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -682,6 +781,7 @@ impl SimpleCutApp {
             key(Modifiers::NONE, Key::S, Action::Split);
             key(Modifiers::NONE, Key::Delete, Action::Delete);
             key(Modifiers::NONE, Key::Backspace, Action::Delete);
+            key(Modifiers::COMMAND, Key::E, Action::OpenExportDialog);
         });
         self.queue.extend(actions);
     }
@@ -712,36 +812,101 @@ impl SimpleCutApp {
     }
 
     fn modal_ui(&mut self, ctx: &egui::Context) {
-        let Some(Modal::Unsaved(then)) = self.modal.clone() else { return };
-        let mut answer: Option<&str> = None;
-        egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-            ui.label(format!("Save changes to “{}” first?", self.editor.project_name()));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Save changes").clicked() {
-                    answer = Some("save");
-                }
-                if ui.button("Discard changes").clicked() {
-                    answer = Some("discard");
-                }
-                if ui.button("Cancel").clicked() {
-                    answer = Some("cancel");
-                }
-            });
-        });
-        match answer {
-            Some("save") => {
-                self.modal = None;
-                if self.save_project() {
-                    self.run_then(then);
+        let Some(modal) = self.modal.clone() else { return };
+        match modal {
+            Modal::Unsaved(then) => {
+                let mut answer: Option<&str> = None;
+                egui::Window::new("Unsaved changes").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                    ui.label(format!("Save changes to “{}” first?", self.editor.project_name()));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save changes").clicked() {
+                            answer = Some("save");
+                        }
+                        if ui.button("Discard changes").clicked() {
+                            answer = Some("discard");
+                        }
+                        if ui.button("Cancel").clicked() {
+                            answer = Some("cancel");
+                        }
+                    });
+                });
+                match answer {
+                    Some("save") => {
+                        self.modal = None;
+                        if self.save_project() {
+                            self.run_then(then);
+                        }
+                    }
+                    Some("discard") => {
+                        self.modal = None;
+                        self.run_then(then);
+                    }
+                    Some(_) => self.modal = None,
+                    None => {}
                 }
             }
-            Some("discard") => {
-                self.modal = None;
-                self.run_then(then);
+            Modal::Export(mut state) => {
+                let t = theme::tokens();
+                let mut close = false;
+                let mut start: Option<(PathBuf, bool)> = None;
+                egui::Window::new("Export video").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                    ui.label(RichText::new("Preset: YouTube 1080p Full HD (1920×1080, H.264 + AAC)").color(t.text_dim));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Destination:");
+                        let shown =
+                            state.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| state.path.to_string_lossy().into_owned());
+                        ui.label(RichText::new(shown).color(t.text));
+                        if ui.button("Browse...").clicked() {
+                            let suggested = state.path.file_name().and_then(|n| n.to_str()).unwrap_or("output.mp4");
+                            if let Some(picked) = self.dialogs.pick_export_path(suggested) {
+                                state.path = picked;
+                                state.overwrite_confirm = false;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut state.use_hardware, "Use graphics card if available");
+                    ui.add_space(8.0);
+
+                    if state.overwrite_confirm {
+                        ui.label(RichText::new("A file with this name already exists. Overwrite?").color(t.danger));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Overwrite").clicked() {
+                                start = Some((state.path.clone(), state.use_hardware));
+                                close = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                state.overwrite_confirm = false;
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("Start export").clicked() {
+                                if state.path.exists() {
+                                    state.overwrite_confirm = true;
+                                } else {
+                                    start = Some((state.path.clone(), state.use_hardware));
+                                    close = true;
+                                }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                close = true;
+                            }
+                        });
+                    }
+                });
+                if close {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::Export(state));
+                }
+                if let Some((path, use_hardware)) = start {
+                    self.perform(Action::StartExport { path, use_hardware });
+                }
             }
-            Some(_) => self.modal = None,
-            None => {}
         }
     }
 
@@ -750,7 +915,7 @@ impl SimpleCutApp {
         self.handle_close(&ctx);
         self.handle_drops(&ctx);
         self.pump(&ctx);
-        if self.modal.is_none() {
+        if self.modal.is_none() && self.active_export.is_none() {
             self.handle_keys(&ctx);
         }
 
@@ -761,6 +926,29 @@ impl SimpleCutApp {
         egui::CentralPanel::default().show(ui, |ui| preview::show(self, ui));
 
         self.modal_ui(&ctx);
+
+        if let Some(job) = &self.active_export {
+            let t = theme::tokens();
+            let mut cancel_clicked = false;
+            egui::Window::new("Exporting video").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
+                let frac = job.fraction();
+                ui.add(egui::ProgressBar::new(frac).text(format!("{:.0}%", frac * 100.0)).desired_width(280.0));
+                ui.add_space(6.0);
+                ui.label(RichText::new(job.status()).color(t.text));
+                if let Some(eta) = job.eta() {
+                    let s = eta.as_secs();
+                    ui.label(RichText::new(format!("{:02}:{:02} remaining", s / 60, s % 60)).color(t.text_dim));
+                }
+                ui.add_space(8.0);
+                if ui.button("Cancel export").clicked() {
+                    cancel_clicked = true;
+                }
+            });
+            if cancel_clicked {
+                self.queue(Action::CancelExport);
+            }
+        }
+
         self.update_title(&ctx);
 
         let actions: Vec<Action> = std::mem::take(&mut self.queue);
@@ -775,7 +963,7 @@ impl eframe::App for SimpleCutApp {
         // a bug in one panel must not close the window and lose the user's work
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_err() {
             log::error!("the interface hit an internal error and carried on");
-            self.banner = Some(Banner { text: "Something went wrong in the interface. Your project is safe; try again.".into(), error: true });
+            self.banner = Some(Banner { text: "Something went wrong in the interface. Your project is safe; try again.".into(), error: true, action: None });
             self.queue.clear();
         }
     }

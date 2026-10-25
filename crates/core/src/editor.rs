@@ -14,6 +14,7 @@ use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
 use crate::error::{EditorError, Result};
+use crate::export::{ExportJob, ExportOptions};
 use crate::view::{ClipView, ImportReport, MediaEntry, SequenceView, TrackView};
 
 pub use filmcraft_project::ItemId;
@@ -519,5 +520,37 @@ impl Editor {
     /// Whether the media has a picture (for the library's icon).
     pub fn has_picture(kind: MediaKind) -> bool {
         !matches!(kind, MediaKind::AudioOnly)
+    }
+
+    // ── export ─────────────────────────────────────────────────────────────
+
+    /// Start a background export job for the active sequence.
+    pub fn start_export(&mut self, options: ExportOptions) -> Result<ExportJob> {
+        let seq = self.sequence().ok_or(EditorError::NoSequence)?;
+        if seq.clip_count() == 0 || seq.duration == Tick::ZERO {
+            return Err(EditorError::Invalid("The timeline is empty. Add media to the timeline before exporting.".into()));
+        }
+        if options.path.as_os_str().is_empty() {
+            return Err(EditorError::Invalid("Choose where to save the exported video.".into()));
+        }
+        let params = json!({
+            "path": options.path.to_string_lossy(),
+            "preset": options.preset,
+            "hardwareEncoding": if options.use_hardware { "auto" } else { "off" },
+            "wait": false,
+        });
+        let r = self.session.execute("file.exportMedia", params)?;
+        let job_id = r["job"].as_u64().ok_or_else(|| EditorError::Engine("exportMedia did not return a job id".into()))?;
+        let job = self.session.jobs.iter().find(|j| j.id == job_id).ok_or_else(|| EditorError::Engine("job not found in session".into()))?;
+        Ok(ExportJob {
+            id: job_id,
+            path: options.path,
+            progress: job.progress.clone(),
+            result: job.result.clone(),
+            expected_duration: seq.duration,
+            expected_fps: seq.fps,
+            expected_width: seq.width,
+            expected_height: seq.height,
+        })
     }
 }

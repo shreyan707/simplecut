@@ -30,4 +30,29 @@ impl Dialogs for NativeDialogs {
         }
         Some(path)
     }
+
+    fn pick_export_path(&self, suggested_name: &str) -> Option<PathBuf> {
+        let mut path = rfd::FileDialog::new().set_title("Export video").add_filter("MP4 video", &["mp4"]).set_file_name(suggested_name).save_file()?;
+        if path.extension().is_none() {
+            path.set_extension("mp4");
+        }
+        Some(path)
+    }
+
+    fn open_folder(&self, path: &std::path::Path) {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.to_string_lossy())).spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            if let Some(parent) = path.parent() {
+                let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+            }
+        }
+    }
 }

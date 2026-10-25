@@ -6,6 +6,7 @@
 
 mod editor;
 mod error;
+mod export;
 mod player;
 mod renderer;
 mod snapshot;
@@ -14,6 +15,7 @@ mod view;
 
 pub use editor::{Edge, Editor, ItemId, Lane, PlaceAt, TrimMode};
 pub use error::{EditorError, Result};
+pub use export::{ExportJob, ExportOptions, ExportState, verify_export};
 pub use player::{AudioOutput, FillFn, PlayState, Player};
 pub use renderer::{PreviewRenderer, RenderedFrame};
 pub use snapshot::{PreviewFrame, Snapshot, Target};
