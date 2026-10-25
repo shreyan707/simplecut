@@ -396,6 +396,33 @@ impl Editor {
         out
     }
 
+    /// Inverse of [`Self::timeline_ranges_of`]: the media file time shown at `timeline_tick` by a clip
+    /// on the main video track for `item`, honouring clip in-point and speed. Returns `None` if
+    /// `timeline_tick` falls in a gap or outside any clip of `item`.
+    pub fn file_time_at(&self, item: ItemId, timeline_tick: Tick) -> Option<Tick> {
+        let q = self.session().active_sequence()?;
+        let track = q.video_tracks.first()?;
+        let matching = track
+            .items
+            .iter()
+            .filter(|c| c.item == item && c.duration > Tick::ZERO)
+            .find(|c| c.start <= timeline_tick && timeline_tick < c.start + c.duration)
+            .or_else(|| track.items.iter().filter(|c| c.item == item && c.duration > Tick::ZERO).find(|c| timeline_tick == c.start + c.duration))?;
+
+        if let Some(held) = matching.frame_hold {
+            return Some(held);
+        }
+
+        let offset_timeline = timeline_tick.0.checked_sub(matching.start.0)?;
+        if !matching.speed.is_finite() || matching.speed <= 0.0 {
+            return None;
+        }
+        let offset_source =
+            if (matching.speed - 1.0).abs() <= f64::EPSILON { offset_timeline } else { (offset_timeline as f64 * matching.speed).round() as i64 };
+        let file_tick = matching.source_in.0.checked_add(offset_source)?;
+        Some(Tick(file_tick))
+    }
+
     /// Whether proposal `p` (for media file `item`) is currently on the timeline.
     ///
     /// Returns [`Presence::Off`] if the total covered length on the main video track is less

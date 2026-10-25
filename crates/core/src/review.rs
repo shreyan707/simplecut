@@ -192,6 +192,75 @@ pub struct ReviewGroup {
     pub sentences: Vec<Sentence>,
 }
 
+impl ReviewGroup {
+    /// Update the span of sentence `sentence_id` within this group.
+    ///
+    /// Rules:
+    /// - `start < end` and span is at least [`MIN_CUT_SECS`] long.
+    /// - Inside `0.0..=media_duration`.
+    /// - Rejects NaN, infinite, negative, or reversed input.
+    /// - Clamps against neighbouring sentences in the same group so spans cannot cross.
+    /// - Recomputes the group's total start and end from its sentences.
+    pub fn set_span(&mut self, sentence_id: &str, start: f64, end: f64, media_duration: f64) -> Result<()> {
+        if !start.is_finite() || !end.is_finite() || !media_duration.is_finite() {
+            return Err(EditorError::Invalid("Span start, end, and media duration must be finite numbers.".into()));
+        }
+        if media_duration <= 0.0 {
+            return Err(EditorError::Invalid("Media duration must be positive.".into()));
+        }
+        if start < 0.0 {
+            return Err(EditorError::Invalid("Span start cannot be negative.".into()));
+        }
+        if end > media_duration {
+            return Err(EditorError::Invalid(format!("Span end ({end:.3}s) cannot be after media duration ({media_duration:.3}s).")));
+        }
+        if start >= end {
+            return Err(EditorError::Invalid(format!("Span start ({start:.3}s) must be before end ({end:.3}s).")));
+        }
+        if end - start < MIN_CUT_SECS {
+            return Err(EditorError::Invalid(format!("Span must be at least {MIN_CUT_SECS} seconds.")));
+        }
+
+        let idx = self
+            .sentences
+            .iter()
+            .position(|s| s.id == sentence_id)
+            .ok_or_else(|| EditorError::Invalid(format!("Sentence “{sentence_id}” not found in group “{}”.", self.id)))?;
+
+        let mut start_tick = Tick::from_seconds_f64(start);
+        let mut end_tick = Tick::from_seconds_f64(end);
+
+        // Clamp to neighbouring sentences of the same group
+        if idx > 0 {
+            let prev_end = self.sentences[idx - 1].end;
+            if start_tick < prev_end {
+                start_tick = prev_end;
+            }
+        }
+        if idx + 1 < self.sentences.len() {
+            let next_start = self.sentences[idx + 1].start;
+            if end_tick > next_start {
+                end_tick = next_start;
+            }
+        }
+
+        let min_cut_ticks = Tick::from_seconds_f64(MIN_CUT_SECS);
+        if end_tick.0 <= start_tick.0 || (end_tick.0 - start_tick.0) < min_cut_ticks.0 {
+            return Err(EditorError::Invalid("Span cannot cross neighbouring sentence or become shorter than minimum cut length.".into()));
+        }
+
+        self.sentences[idx].start = start_tick;
+        self.sentences[idx].end = end_tick;
+
+        if let (Some(min_s), Some(max_e)) = (self.sentences.iter().map(|s| s.start).min(), self.sentences.iter().map(|s| s.end).max()) {
+            self.start = min_s;
+            self.end = max_e;
+        }
+
+        Ok(())
+    }
+}
+
 /// The pipeline's second answer: groups of sentences.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Groups {
@@ -697,5 +766,92 @@ mod tests {
         let s = Sentence { id: "x".into(), start: t(1.0), end: t(2.0), text: "hello".into(), confidence: None };
         let c = s.as_cut();
         assert_eq!((c.id.as_str(), c.start, c.end, c.removed_text.as_str()), ("x", t(1.0), t(2.0), "hello"));
+    }
+
+    #[test]
+    fn review_group_set_span_hostile_numbers_and_neighbour_clamping() {
+        let make_group = || ReviewGroup {
+            id: "g1".into(),
+            start: t(1.0),
+            end: t(5.0),
+            likely: true,
+            sentences: vec![
+                Sentence { id: "s1".into(), start: t(1.0), end: t(2.0), text: "first".into(), confidence: None },
+                Sentence { id: "s2".into(), start: t(3.0), end: t(5.0), text: "second".into(), confidence: None },
+            ],
+        };
+
+        let media_dur = 60.0;
+
+        // 1. Hostile inputs: NaN, infinity, reversed, negative, huge, zero length, too short
+        let hostile_cases = [
+            (f64::NAN, 4.0, "NaN start"),
+            (3.0, f64::NAN, "NaN end"),
+            (f64::INFINITY, 4.0, "+inf start"),
+            (3.0, f64::INFINITY, "+inf end"),
+            (f64::NEG_INFINITY, 4.0, "-inf start"),
+            (4.0, 2.0, "reversed"),
+            (-1.0, 4.0, "negative start"),
+            (100.0, 120.0, "huge past media duration"),
+            (3.0, 65.0, "end past media duration"),
+            (3.0, 3.0, "zero length"),
+            (3.0, 3.005, "under MIN_CUT_SECS"),
+        ];
+
+        for (st, en, label) in hostile_cases {
+            let mut g = make_group();
+            assert!(g.set_span("s2", st, en, media_dur).is_err(), "hostile input should fail: {label}");
+            assert_eq!(g, make_group(), "failed edit must leave group unchanged");
+        }
+
+        // Hostile media duration
+        let mut g = make_group();
+        assert!(g.set_span("s2", 3.0, 4.0, f64::NAN).is_err());
+        assert!(g.set_span("s2", 3.0, 4.0, -10.0).is_err());
+        assert!(g.set_span("s2", 3.0, 4.0, 0.0).is_err());
+
+        // Non-existent sentence
+        assert!(g.set_span("nonexistent", 3.0, 4.0, media_dur).is_err());
+
+        // 2. Normal edit within bounds updates sentence and recomputes group span
+        let mut g = make_group();
+        g.set_span("s2", 2.5, 6.0, media_dur).unwrap();
+        assert_eq!(g.sentences[1].start, t(2.5));
+        assert_eq!(g.sentences[1].end, t(6.0));
+        assert_eq!(g.start, t(1.0));
+        assert_eq!(g.end, t(6.0), "group end expanded");
+
+        // 3. Moving sentence 1 start earlier updates group start
+        g.set_span("s1", 0.5, 2.0, media_dur).unwrap();
+        assert_eq!(g.sentences[0].start, t(0.5));
+        assert_eq!(g.start, t(0.5), "group start expanded earlier");
+
+        // 4. Neighbour clamping:
+        // Trying to move s2 start before s1 end (2.0): clamps to 2.0
+        let mut g = make_group();
+        g.set_span("s2", 1.5, 4.0, media_dur).unwrap();
+        assert_eq!(g.sentences[1].start, t(2.0), "clamped to prev sentence end");
+        assert_eq!(g.sentences[1].end, t(4.0));
+
+        // Trying to move s1 end past s2 start (3.0): clamps to 3.0
+        let mut g = make_group();
+        g.set_span("s1", 1.0, 3.5, media_dur).unwrap();
+        assert_eq!(g.sentences[0].start, t(1.0));
+        assert_eq!(g.sentences[0].end, t(3.0), "clamped to next sentence start");
+
+        // Trying to move s2 completely before s1: clamped start = 2.0, end = 1.5 -> rejected
+        let mut g = make_group();
+        assert!(g.set_span("s2", 0.5, 1.5, media_dur).is_err(), "cannot cross neighbour completely");
+        assert_eq!(g, make_group(), "group unchanged after error");
+
+        // Trying to move s1 completely after s2: clamped end = 3.0, start = 3.5 -> rejected
+        let mut g = make_group();
+        assert!(g.set_span("s1", 3.5, 4.5, media_dur).is_err(), "cannot cross neighbour completely");
+        assert_eq!(g, make_group(), "group unchanged after error");
+
+        // Clamping leaving less than MIN_CUT_SECS: rejected
+        let mut g = make_group();
+        assert!(g.set_span("s2", 1.0, 2.005, media_dur).is_err(), "clamped span < MIN_CUT_SECS");
+        assert_eq!(g, make_group());
     }
 }

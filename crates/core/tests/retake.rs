@@ -397,3 +397,60 @@ fn a_group_removed_completely_and_two_adjacent_groups_removed_completely_are_one
     assert_eq!(e.sequence().unwrap().tracks[0].clips.len(), 1);
     assert!((s_of(e.sequence().unwrap().duration) - 10.0).abs() < 0.05);
 }
+
+#[test]
+fn file_time_at_honours_in_point_speed_and_reports_gaps() {
+    let Some((mut e, item)) = project() else { return };
+
+    // 1. Plain clip: placed at 0.0s, duration 10.0s, source_in 0.0s, speed 1.0
+    assert_eq!(e.file_time_at(item, secs(0.0)), Some(secs(0.0)));
+    assert_eq!(e.file_time_at(item, secs(3.5)), Some(secs(3.5)));
+    assert_eq!(e.file_time_at(item, secs(10.0)), Some(secs(10.0)));
+
+    // 2. A gap / outside bounds / wrong item
+    assert_eq!(e.file_time_at(item, secs(-1.0)), None, "negative timeline tick is outside");
+    assert_eq!(e.file_time_at(item, secs(10.5)), None, "past clip end is a gap");
+    assert_eq!(e.file_time_at(ItemId(999_999), secs(3.0)), None, "wrong item");
+
+    // 3. After a trim: trim start of clip by 2.0s
+    let clip_id = track(&e.sequence().unwrap(), "Video").clips[0].id;
+    e.trim(clip_id, Edge::Start, secs(2.0), TrimMode::Ripple).unwrap();
+    // Clip now starts at 0.0s, duration 8.0s, source_in 2.0s
+    assert_eq!(e.file_time_at(item, secs(0.0)), Some(secs(2.0)));
+    assert_eq!(e.file_time_at(item, secs(3.0)), Some(secs(5.0)));
+    assert_eq!(e.file_time_at(item, secs(8.0)), Some(secs(10.0)));
+    assert_eq!(e.file_time_at(item, secs(8.5)), None, "past trimmed end");
+
+    // 4. After a razor split: split at playhead = 3.0s (which is source time 5.0s)
+    e.set_playhead(secs(3.0));
+    e.split_at_playhead().unwrap();
+    // Clip 1: timeline 0.0..3.0, source 2.0..5.0
+    // Clip 2: timeline 3.0..8.0, source 5.0..10.0
+    assert_eq!(e.file_time_at(item, secs(1.5)), Some(secs(3.5)));
+    assert_eq!(e.file_time_at(item, secs(3.0)), Some(secs(5.0)), "at split point matches clip 2 start");
+    assert_eq!(e.file_time_at(item, secs(5.0)), Some(secs(7.0)));
+
+    // 5. Gap between clips:
+    // Move second clip to start at 4.0s (leaving a 1.0s gap from 3.0 to 4.0)
+    let clip2_id = track(&e.sequence().unwrap(), "Video").clips[1].id;
+    e.move_clip(clip2_id, secs(4.0)).unwrap();
+    assert_eq!(e.file_time_at(item, secs(3.5)), None, "inside gap between clips");
+
+    // 6. Speed-changed clip:
+    let Some((mut e_speed, item_speed)) = project() else { return };
+    e_speed
+        .session_mut()
+        .edit_sequence("speed", |seq, _, _| {
+            seq.video_tracks[0].items[0].speed = 1.5;
+            seq.video_tracks[0].items[0].source_in = secs(1.0);
+            seq.video_tracks[0].items[0].duration = secs(4.0);
+            Ok(())
+        })
+        .unwrap();
+    // Clip starts at 0.0, source_in 1.0s, speed 1.5, duration 4.0s
+    // At timeline 2.0s: offset = 2.0s * 1.5 = 3.0s -> file time = 1.0 + 3.0 = 4.0s
+    assert_eq!(e_speed.file_time_at(item_speed, secs(2.0)), Some(secs(4.0)));
+    assert_eq!(e_speed.file_time_at(item_speed, secs(0.0)), Some(secs(1.0)));
+    assert_eq!(e_speed.file_time_at(item_speed, secs(4.0)), Some(secs(7.0)));
+    assert_eq!(e_speed.file_time_at(item_speed, secs(4.5)), None);
+}
