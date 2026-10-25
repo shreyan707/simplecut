@@ -302,3 +302,104 @@ Optional "Ask AI to choose" only when capabilities say so. Answers are logged to
 Limits: one video file per review; /1 files are no longer read; the real HTTP client for the owner's
 Python service is not written yet (use SIMPLECUT_FAKE_RETAKES=1 to try the flow with the fake one).
 Tests: crates/ui/tests/retake_window.rs, crates/core/tests/analyzer.rs.
+
+## 16. NEXT WORK (assigned to the coding agent): delete anything, preview the cuts, adjustable spans, seek slider
+
+Base: section 15 (retake review v2, commit 97ff082). Do the packages in this order, one commit each, only when
+green. Gates every time: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (run 3 times, read the real `test result` lines; do not pipe through `tail`).
+Run cargo through PowerShell (add `%USERPROFILE%\.cargo\bin` to PATH). Drive Z: is small: if a link fails with
+"insufficient disk space", run `cargo clean` in Z:\simplecut. No unwrap/expect/panic in product code; never
+weaken a test to make it pass; every interaction is an `Action` (panels only draw and `queue()`).
+
+Decisions already made (do not re-decide):
+- Span edits live in the review (`Review.groups`), not in project history. Ctrl+Z does not undo them; each edited
+  sentence has "Reset span" (keep the original in `Review.original`).
+- Span rules: start < end; at least `MIN_CUT_SECS` long; inside 0..media duration; may not cross the neighbouring
+  sentence of the same group (clamp to its edge). Group start/end = min start / max end of its sentences, recomputed
+  after every edit. Reject NaN/infinite/reversed input.
+- Preview skipping is done in the player, never by editing the timeline. Music is not cut by Remove
+  (`CutScope::MainTracks`), so the preview is approximate for the music bed; say so in the hint text.
+
+### A. Seek slider (do first)
+- `crates/ui/src/timeline.rs::show`: a full-width row above `header_row`: a slider over `0..=seq.duration` showing the
+  playhead, plus "current / total" text. It is the overview, so it does not follow timeline zoom.
+- Dragging queues `Action::SeekTimeline(tick)` only when the value changed. Pause while dragging, resume on release if it
+  was playing (`Player::seek` restarts the audio feeder, so do not call it every frame for the same value).
+- Accessible label "Timeline seek"; arrow keys step one frame. Disabled on an empty timeline.
+- Test hook `SimpleCutApp::seek_slider_rect()`.
+- Tests (egui_kittest, real mouse events): drag to the middle -> playhead about half; follows the playhead during
+  playback; disabled when empty; no seek action when the value does not change; works while zoomed.
+
+### B. Delete anything (remove the "keep at least one" rule)
+- `crates/ui/src/retakes.rs::set_keep`: remove the refusal (`stay == 0`) and its banner text
+  ("Keep at least one take..."). Nothing else changes in the keep model.
+- Add a per-group "Remove all" button (unticks every sentence of the group that is on the timeline) beside
+  "Keep last only" / "Keep all". Group header shows "all removed" in the danger colour when nothing is kept.
+  No confirmation dialog: nothing happens until Remove, and Remove is one undo step.
+- `docs/retake-contract.md`: delete "At least one take of each group must stay kept".
+- Replace the test `at_least_one_sentence_of_a_group_stays_and_the_helpers_work`: unticking the last sentence now works
+  and `review_cut_count()` equals the group size.
+- Core tests (`crates/core/tests/analyzer.rs` or `retake.rs`): a group removed completely, and two adjacent groups removed
+  completely, are one undo step with exact source offsets and no slivers.
+
+### C-core. Span editing in core
+- `Editor::file_time_at(item, timeline_tick) -> Option<Tick>`: inverse of `timeline_ranges_of` (the clip containing the
+  tick, honouring in-point and speed; None on a gap). Tests: plain clip, after a trim, after a razor split, speed-changed
+  clip, a gap.
+- `crates/core/src/review.rs`: `ReviewGroup::set_span(sentence_id, start, end, media_duration) -> Result<()>` implementing
+  the span rules and recomputing the group span. Pure; unit tests with hostile numbers (NaN, reversed, negative, huge,
+  zero length, crossing a neighbour).
+
+### D. Preview skips unticked sentences
+- `crates/core/src/player.rs`: `Player::set_skips(Vec<(Tick, Tick)>)` (timeline time; sort, merge, drop empty and
+  non-finite ranges, cap the count). In `tick()`: while playing the sequence, if `now` is inside a skip `[s, e)`, restart
+  playback at `e` the way `seek` does (`halt()` then `begin(snapshot, e)`), set the playhead, and count it
+  (`Player::skips()` for tests). If `e >= end`, end playback normally. Starting or seeking inside a skip jumps to its end.
+  It must never loop (after a jump `now >= e`). Works with and without a sound card (wall-clock fallback).
+  The audio clock is buffered, so a jump may land up to one frame late; if the test shows an audible tail, compare
+  `now + one UI frame` against `s`.
+- `SimpleCutApp::pump`: every frame while a review is open and the checkbox "Skip unticked sentences when playing"
+  (Review header, default on) is on, set the skips from `review_marks()` of kind `Cut` (timeline ranges, merged). Clear
+  them when the review closes, after Remove, and on project change.
+- Tests (fake sound card, as in `crates/core/tests/playback.rs`): group a, b, c with only b kept: play from the start
+  of a -> playhead jumps over a, plays b, jumps over c, ends; `skips()` is 2; checkbox off -> no skips; after Remove
+  nothing is left to skip; Undo brings the skips back; seeking into a range lands at its end; an edit made during
+  playback does not break skipping.
+
+### C-UI. Adjustable spans in the window
+- `Review.original: HashMap<String, (Tick, Tick)>`. Actions `SetSentenceSpan { sentence, start, end }` and
+  `ResetSentenceSpan(String)`, both applied through `set_span`; each edit appends a line to `span_edits.jsonl` next to
+  `labels.jsonl` (`time`, `job`, `sentence`, old and new start/end in seconds, `source: "user"`; log before applying, like
+  labels). Add `SimpleCutApp::set_span_log(Option<PathBuf>)` and call it from `apps/simplecut/src/main.rs` with
+  `data_dir.join("span_edits.jsonl")`.
+- Sidebar (each sentence row): start and end as drag-value fields in seconds (2 decimals), -/+ 0.05 s nudge buttons on each
+  edge, an "edited" tag and "Reset span" when changed. The group header span updates. Automation labels
+  `Start of <id>`, `End of <id>`, `Reset span of <id>`.
+- Timeline (`timeline.rs`): the Cut/Kept marks on the video lane get draggable edges (about 5 px hit zone). A drag that
+  starts on a sentence edge wins over clip trimming. Convert the pointer with `file_time_at`, apply live through
+  `SetSentenceSpan`, tooltip with the new time. Edges over a gap are ignored.
+- "Highlight strength" slider (0.1 to 0.8, default 0.45) in the Review header replaces the fixed 0.55 fill of cut
+  sentences in `paint_review`. UI state only.
+- "Save groups..." button: writes the current groups (edited times, group spans) as a `simplecut.retakes/2`
+  `stage: "groups"` file using `review::groups_to_json`. Add `Dialogs::pick_groups_save_path(suggested)` (default method
+  returning None, implemented in `apps/simplecut/src/dialogs.rs` with rfd and in the test `Script`).
+- Tests: dragging an edge with real mouse events changes the sentence, the group span and `review_marker_rects`; Remove
+  cuts exactly the edited span (check source offsets); numeric field edit; clamping against the neighbour; reset;
+  `span_edits.jsonl` content; the saved file is accepted by `Editor::read_review` and holds the edited times; a test where a
+  sentence edge and a clip edge coincide (clip trimming still works elsewhere; existing timeline tests unchanged).
+
+### E. Docs
+- `docs/retake-contract.md`: span editing, `span_edits.jsonl`, the saved groups file. Update section 15 of this file with
+  what changed and any limitation you found.
+
+### Reviewer checklist (the reviewer checks these independently afterwards)
+- Gates pass three times in a row; real `test result` lines read.
+- The "at least one" rule is gone from code, tests and docs (grep the old banner text).
+- Skip preview goes through the player (the timeline is not edited), has no jump loop, nothing skips after Remove,
+  works without a sound card, edits during playback still work.
+- Span edits keep ranges valid under hostile numbers; Remove and the preview use the edited spans; no `[i]` indexing on
+  data from files.
+- Clip trim and move on the timeline still work; seek slider does not restart audio every frame.
+- No new unwrap/expect/panic in product code; no test weakened.
+- Report honestly in the final message what was NOT verified (for example anything that needs ears).
