@@ -78,28 +78,28 @@ fn finding_reviewing_and_removing_retakes_is_one_undo_step() {
     assert!(!h.state().is_analyzing());
 
     // the sure ones are selected, the unsure one is left for the user
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
-    assert!(h.state().review_is_approved("fake_0:0") && h.state().review_is_approved("fake_2:0"));
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
+    assert!(h.state().review_is_approved("fake_0:0") && h.state().review_is_approved("fake_0:1") && h.state().review_is_approved("fake_2:0"));
     assert!(!h.state().review_is_approved("fake_1:0"), "a 'review' suggestion is never pre-selected");
-    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Found 3") && b.text.contains("2 selected")));
-    h.get_by_label("Remove 2 retakes");
+    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Found 4") && b.text.contains("3 selected")));
+    h.get_by_label("Remove 3 retakes");
 
     // markers on the timeline sit on the video lane
     let lane = h.state().timeline_lane(0).unwrap();
     let markers = h.state().review_marker_rects();
-    assert_eq!(markers.len(), 3);
+    assert_eq!(markers.len(), 4);
     assert!(markers.iter().all(|m| m.top() >= lane.top() - 1.0 && m.bottom() <= lane.bottom() + 1.0 && m.width() > 1.0));
 
-    click(&mut h, "Remove 2 retakes");
+    click(&mut h, "Remove 3 retakes");
     let after = video_pieces(&h);
-    // the file's 0.4-0.6 s and 2.8-2.88 s are gone: it plays 0-0.4, 0.6-2.8 and 2.88-4
-    assert_eq!(after.len(), 3, "{after:?}");
-    for (got, want) in after.iter().map(|p| p.1).zip([0.0, 0.6, 2.88]) {
+    // the file's 0.4-0.6 s, 0.72-0.88 s and 2.8-2.88 s are gone
+    assert_eq!(after.len(), 4, "{after:?}");
+    for (got, want) in after.iter().map(|p| p.1).zip([0.0, 0.6, 0.88, 2.88]) {
         assert!((got - want).abs() < 0.05, "{after:?}");
     }
     let total: f64 = after.iter().map(|p| p.0).sum();
-    assert!((total - (4.0 - 0.2 - 0.08)).abs() < 0.08, "{total}");
-    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Removed 2 retakes")), "{:?}", h.state().banner());
+    assert!((total - (4.0 - 0.2 - 0.16 - 0.08)).abs() < 0.08, "{total}");
+    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Removed 3 retakes")), "{:?}", h.state().banner());
     assert_eq!(h.state().editor().session().history.undo.len(), steps + 1, "one undo step");
     assert_eq!(h.state().review_summary(), Some((1, 0)), "the one left for review is still listed");
     assert_eq!(h.state().review_marker_rects().len(), 1);
@@ -118,14 +118,14 @@ fn suggestions_can_be_toggled_and_selected_in_bulk() {
     let mut h = ready(FakeAnalyzer::default());
     analyse(&mut h);
     click(&mut h, "Select suggestion fake_1:0");
-    assert_eq!(h.state().review_summary(), Some((3, 3)));
+    assert_eq!(h.state().review_summary(), Some((4, 4)));
     click(&mut h, "Select suggestion fake_1:0");
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
     click(&mut h, "Select none");
-    assert_eq!(h.state().review_summary(), Some((3, 0)));
+    assert_eq!(h.state().review_summary(), Some((4, 0)));
     assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled(), "nothing selected, nothing to remove");
     click(&mut h, "Select sure ones");
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
     let clips = h.state().editor().sequence().unwrap().clip_count();
     assert_eq!(clips, 2, "reviewing cuts nothing");
 }
@@ -242,18 +242,19 @@ fn undo_and_redo_with_review_open_brings_suggestions_back() {
     }
     let mut h = ready(FakeAnalyzer::default());
     analyse(&mut h);
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
-    assert_eq!(h.state().review_marker_rects().len(), 3);
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
+    assert_eq!(h.state().review_marker_rects().len(), 4);
 
-    click(&mut h, "Remove 2 retakes");
+    click(&mut h, "Remove 3 retakes");
     assert_eq!(h.state().review_summary(), Some((1, 0)));
     assert_eq!(h.state().review_marker_rects().len(), 1);
 
     click(&mut h, "Undo");
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
     assert!(h.state().review_is_approved("fake_0:0"));
+    assert!(h.state().review_is_approved("fake_0:1"));
     assert!(h.state().review_is_approved("fake_2:0"));
-    assert_eq!(h.state().review_marker_rects().len(), 3);
+    assert_eq!(h.state().review_marker_rects().len(), 4);
 
     click(&mut h, "Redo");
     assert_eq!(h.state().review_summary(), Some((1, 0)));
@@ -267,7 +268,7 @@ fn rerun_analysis_on_cut_video_lists_cut_ones_as_already_removed_without_sliver(
     }
     let mut h = ready(FakeAnalyzer::default());
     analyse(&mut h);
-    click(&mut h, "Remove 2 retakes");
+    click(&mut h, "Remove 3 retakes");
 
     click(&mut h, "Remove Retakes");
     step_until(&mut h, "the re-analysis", |a| !a.is_analyzing());
@@ -358,12 +359,12 @@ fn counts_and_button_label_ignore_off_suggestions() {
     }
     let mut h = ready(FakeAnalyzer::default());
     analyse(&mut h);
-    assert_eq!(h.state().review_summary(), Some((3, 2)));
-    h.get_by_label("Remove 2 retakes");
+    assert_eq!(h.state().review_summary(), Some((4, 3)));
+    h.get_by_label("Remove 3 retakes");
 
-    // Remove the 2 retakes
-    click(&mut h, "Remove 2 retakes");
-    // Now 2 are Off, only 1 is On (and it was a review one, unselected)
+    // Remove the 3 retakes
+    click(&mut h, "Remove 3 retakes");
+    // Now 3 are Off, only 1 is On (and it was a review one, unselected)
     assert_eq!(h.state().review_summary(), Some((1, 0)));
     assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled());
     assert_eq!(h.state().review_marker_rects().len(), 1);
@@ -372,4 +373,134 @@ fn counts_and_button_label_ignore_off_suggestions() {
     click(&mut h, "Select suggestion fake_1:0");
     assert_eq!(h.state().review_summary(), Some((1, 1)));
     assert!(!h.get_by_label("Remove 1 retake").accesskit_node().is_disabled());
+}
+
+#[test]
+fn groups_have_headers_with_labels_and_counts_and_collapsing_hides_rows() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+
+    // Test hook returns groups with (label, color, on_ids)
+    let groups = h.state().review_groups();
+    assert_eq!(groups.len(), 3);
+    assert_eq!(groups[0], ("Retake 1".into(), 0, vec!["fake_0:0".into(), "fake_0:1".into()]));
+    assert_eq!(groups[1], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
+    assert_eq!(groups[2], ("Retake 3".into(), 2, vec!["fake_2:0".into()]));
+
+    // Accessible headers and checkboxes are present
+    h.get_by_label("Group Retake 1");
+    h.get_by_label("Group Retake 2");
+    h.get_by_label("Group Retake 3");
+    h.get_by_label("Select group Retake 1");
+    h.get_by_label("Select group Retake 2");
+    h.get_by_label("Select group Retake 3");
+
+    // Member rows are visible by default
+    assert!(h.query_by_label("Select suggestion fake_0:0").is_some());
+    assert!(h.query_by_label("Select suggestion fake_0:1").is_some());
+
+    // Collapsing Retake 1 hides its member rows
+    click(&mut h, "Group Retake 1");
+    assert!(h.query_by_label("Select suggestion fake_0:0").is_none());
+    assert!(h.query_by_label("Select suggestion fake_0:1").is_none());
+    // Other group rows remain visible
+    assert!(h.query_by_label("Select suggestion fake_1:0").is_some());
+
+    // Expanding Retake 1 brings its member rows back
+    click(&mut h, "Group Retake 1");
+    assert!(h.query_by_label("Select suggestion fake_0:0").is_some());
+    assert!(h.query_by_label("Select suggestion fake_0:1").is_some());
+}
+
+#[test]
+fn group_checkbox_toggles_all_members_and_shows_in_between_state() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+
+    // Initially both members of fake_0 are approved
+    assert!(h.state().review_is_approved("fake_0:0"));
+    assert!(h.state().review_is_approved("fake_0:1"));
+    let cb = h.get_by_label("Select group Retake 1");
+    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+
+    // Clicking group checkbox deselects all members
+    click(&mut h, "Select group Retake 1");
+    assert!(!h.state().review_is_approved("fake_0:0"));
+    assert!(!h.state().review_is_approved("fake_0:1"));
+    let cb = h.get_by_label("Select group Retake 1");
+    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
+
+    // Selecting one member puts the group checkbox in indeterminate (in-between) state
+    click(&mut h, "Select suggestion fake_0:0");
+    assert!(h.state().review_is_approved("fake_0:0"));
+    assert!(!h.state().review_is_approved("fake_0:1"));
+    let cb = h.get_by_label("Select group Retake 1");
+    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::Mixed));
+
+    // Clicking the group checkbox while in in-between state approves all members
+    click(&mut h, "Select group Retake 1");
+    assert!(h.state().review_is_approved("fake_0:0"));
+    assert!(h.state().review_is_approved("fake_0:1"));
+    let cb = h.get_by_label("Select group Retake 1");
+    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+}
+
+#[test]
+fn colours_of_rows_and_markers_match_per_group() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+
+    let groups = h.state().review_groups();
+    assert_eq!(groups[0].1, 0); // Retake 1 has color 0
+    assert_eq!(groups[1].1, 1); // Retake 2 has color 1
+    assert_eq!(groups[2].1, 2); // Retake 3 has color 2
+
+    // Marker colors match the group of each proposal: fake_0:0 (0), fake_0:1 (0), fake_1:0 (1), fake_2:0 (2)
+    let marker_colors = h.state().review_marker_colors();
+    assert_eq!(marker_colors, vec![0, 0, 1, 2]);
+}
+
+#[test]
+fn groups_of_off_suggestions_are_not_in_live_list_and_undo_redo_preserves_group_state() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+    assert_eq!(h.state().review_groups().len(), 3);
+
+    // Remove the 3 sure retakes (fake_0:0, fake_0:1, fake_2:0)
+    click(&mut h, "Remove 3 retakes");
+
+    // Groups whose suggestions are all Off (fake_0 and fake_2) leave the live list
+    let groups = h.state().review_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
+    assert!(h.query_by_label("Group Retake 1").is_none());
+    assert!(h.query_by_label("Group Retake 3").is_none());
+    assert_eq!(h.state().review_marker_colors(), vec![1]);
+
+    // Undo brings all 3 groups back with their original approved state and colors
+    click(&mut h, "Undo");
+    let groups = h.state().review_groups();
+    assert_eq!(groups.len(), 3);
+    assert_eq!(groups[0], ("Retake 1".into(), 0, vec!["fake_0:0".into(), "fake_0:1".into()]));
+    assert_eq!(groups[1], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
+    assert_eq!(groups[2], ("Retake 3".into(), 2, vec!["fake_2:0".into()]));
+    assert!(h.state().review_is_approved("fake_0:0") && h.state().review_is_approved("fake_0:1") && h.state().review_is_approved("fake_2:0"));
+    assert_eq!(h.state().review_marker_colors(), vec![0, 0, 1, 2]);
+
+    // Redo again drops the Off groups
+    click(&mut h, "Redo");
+    assert_eq!(h.state().review_groups().len(), 1);
+    assert_eq!(h.state().review_marker_colors(), vec![1]);
 }

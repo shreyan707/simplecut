@@ -453,12 +453,12 @@ fn paint_review(app: &SimpleCutApp, painter: &egui::Painter, axis: &Axis, lanes:
     if ranges.is_empty() {
         return;
     }
-    let t = theme::tokens();
     let (Some(top), Some(bottom)) = (lanes.first(), lanes.get(1)) else { return };
-    for (start, end, approved) in ranges {
+    for (start, end, approved, color_idx) in ranges {
+        let color = theme::GROUP_COLORS[color_idx % theme::GROUP_COLORS.len()];
         let r = Rect::from_min_max(pos2(axis.x_of(start), top.top()), pos2(axis.x_of(end).max(axis.x_of(start) + 2.0), bottom.bottom()));
-        painter.rect_filled(r, CornerRadius::same(3), t.danger.gamma_multiply(if approved { 0.45 } else { 0.18 }));
-        painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(if approved { 2.0 } else { 1.0 }, t.danger), StrokeKind::Inside);
+        painter.rect_filled(r, CornerRadius::same(3), color.gamma_multiply(if approved { 0.45 } else { 0.18 }));
+        painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(if approved { 2.0 } else { 1.0 }, color), StrokeKind::Inside);
     }
 }
 

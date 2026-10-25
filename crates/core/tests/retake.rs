@@ -9,7 +9,7 @@
 mod common;
 
 use common::{have, make_clip, make_music, scratch};
-use simplecut_core::retake::{CutProposal, CutScope, Decision, Presence};
+use simplecut_core::retake::{Analysis, CutProposal, CutScope, Decision, PALETTE_SIZE, Presence, groups, groups_with_offset};
 use simplecut_core::{Edge, Editor, EditorError, ItemId, Lane, PlaceAt, SequenceView, Tick, TrackView, TrimMode};
 
 const TPS: f64 = 254_016_000_000.0;
@@ -255,4 +255,71 @@ fn presence_reports_on_off_and_handles_speed_changed_and_frame_hold_clips() {
         .unwrap();
     assert_eq!(e3.presence(item3, &p), Presence::Off);
     assert!(e3.is_outside_used(item3, &p));
+}
+
+#[test]
+fn groups_groups_proposals_by_key_ordered_by_start_with_color_modulo_and_offset() {
+    let mut proposals = Vec::new();
+    // Group "g_b" starts at 1.0s and 1.5s
+    let mut p0 = proposal("b1", 1.0, 1.2);
+    p0.group = Some("g_b".into());
+    let mut p1 = proposal("b2", 1.5, 1.8);
+    p1.group = Some("g_b".into());
+
+    // Group "g_a" starts at 0.5s
+    let mut p2 = proposal("a1", 0.5, 0.8);
+    p2.group = Some("g_a".into());
+
+    // Singleton without group starts at 0.2s
+    let p3 = proposal("single", 0.2, 0.4);
+
+    // Add in arbitrary order
+    proposals.push(p0); // idx 0
+    proposals.push(p1); // idx 1
+    proposals.push(p2); // idx 2
+    proposals.push(p3); // idx 3
+
+    let analysis = Analysis { item: ItemId(1), generator: None, proposals, rejected: Vec::new() };
+
+    let grps = groups(&analysis);
+    assert_eq!(grps.len(), 3);
+
+    // 1. Singleton without group starts earliest (0.2s) -> Retake 1, color 0, key is proposal id
+    assert_eq!(grps[0].key, "single");
+    assert_eq!(grps[0].label, "Retake 1");
+    assert_eq!(grps[0].color, 0);
+    assert_eq!(grps[0].members, vec![3]);
+
+    // 2. Group "g_a" starts at 0.5s -> Retake 2, color 1
+    assert_eq!(grps[1].key, "g_a");
+    assert_eq!(grps[1].label, "Retake 2");
+    assert_eq!(grps[1].color, 1);
+    assert_eq!(grps[1].members, vec![2]);
+
+    // 3. Group "g_b" starts at 1.0s -> Retake 3, color 2, 2 members ordered by start
+    assert_eq!(grps[2].key, "g_b");
+    assert_eq!(grps[2].label, "Retake 3");
+    assert_eq!(grps[2].color, 2);
+    assert_eq!(grps[2].members, vec![0, 1]);
+
+    // Multi-file continuation with offset
+    let grps2 = groups_with_offset(&analysis, 3);
+    assert_eq!(grps2[0].label, "Retake 4");
+    assert_eq!(grps2[0].color, 3);
+    assert_eq!(grps2[1].label, "Retake 5");
+    assert_eq!(grps2[1].color, 4);
+    assert_eq!(grps2[2].label, "Retake 6");
+    assert_eq!(grps2[2].color, 5);
+
+    // Color modulo wraps at PALETTE_SIZE (8)
+    assert_eq!(PALETTE_SIZE, 8);
+    let grps_wrapped = groups_with_offset(&analysis, 7);
+    assert_eq!(grps_wrapped[0].color, 7);
+    assert_eq!(grps_wrapped[1].color, 0); // 8 % 8 = 0
+    assert_eq!(grps_wrapped[2].color, 1); // 9 % 8 = 1
+
+    // Determinism: calling groups multiple times yields identical results
+    for _ in 0..10 {
+        assert_eq!(groups(&analysis), grps);
+    }
 }

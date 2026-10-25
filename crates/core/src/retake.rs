@@ -172,6 +172,62 @@ pub struct Analysis {
     pub rejected: Vec<Rejected>,
 }
 
+/// The number of distinct colors in the retake group palette.
+pub const PALETTE_SIZE: usize = 8;
+
+/// A group of retake proposals (e.g. discarded takes before the same kept take).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    /// The proposal `group`, or a unique key made from its id when it has none (a group of one).
+    pub key: String,
+    /// Friendly label: "Retake 1", "Retake 2", etc.
+    pub label: String,
+    /// Position in order modulo [`PALETTE_SIZE`].
+    pub color: usize,
+    /// Indexes into `Analysis.proposals`, ordered by start.
+    pub members: Vec<usize>,
+}
+
+/// Group proposals in `analysis` by retake group.
+///
+/// Proposals sharing a `group` key belong to the same group. A proposal without a `group`
+/// is its own group. Groups are ordered by the earliest start of any member.
+pub fn groups(analysis: &Analysis) -> Vec<Group> {
+    groups_with_offset(analysis, 0)
+}
+
+/// Group proposals with numbering and colors starting from `offset`.
+pub fn groups_with_offset(analysis: &Analysis, offset: usize) -> Vec<Group> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+
+    for (idx, p) in analysis.proposals.iter().enumerate() {
+        let key = p.group.as_ref().filter(|g| !g.trim().is_empty()).cloned().unwrap_or_else(|| p.id.clone());
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.entry(key).or_default().push(idx);
+    }
+
+    order.sort_by(|a, b| {
+        let min_a = map[a].iter().map(|&idx| analysis.proposals[idx].start).min().unwrap_or(Tick::ZERO);
+        let min_b = map[b].iter().map(|&idx| analysis.proposals[idx].start).min().unwrap_or(Tick::ZERO);
+        (min_a, a).cmp(&(min_b, b))
+    });
+
+    order
+        .into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let num = offset + i + 1;
+            let color = (offset + i) % PALETTE_SIZE;
+            let mut members = map.remove(&key).unwrap_or_default();
+            members.sort_by_key(|&idx| (analysis.proposals[idx].start, analysis.proposals[idx].end, &analysis.proposals[idx].id));
+            Group { key, label: format!("Retake {num}"), color, members }
+        })
+        .collect()
+}
+
 fn secs(t: f64) -> Tick {
     Tick::from_seconds_f64(t)
 }

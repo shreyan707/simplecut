@@ -125,15 +125,25 @@ impl SimpleCutApp {
         self.retakes.review.as_ref().map_or(0, |r| r.rejected().len())
     }
 
-    /// Where the suggestions are on the timeline: (start, end, approved), for drawing.
-    pub(crate) fn review_ranges(&self) -> Vec<(Tick, Tick, bool)> {
+    /// Where the suggestions are on the timeline: (start, end, approved, color_index), for drawing.
+    pub(crate) fn review_ranges(&self) -> Vec<(Tick, Tick, bool, usize)> {
         let Some(r) = &self.retakes.review else { return Vec::new() };
         let mut out = Vec::new();
+        let mut offset = 0;
         for a in &r.analyses {
-            for p in &a.proposals {
+            let grps = retake::groups_with_offset(a, offset);
+            offset += grps.len();
+            let mut prop_color = vec![0; a.proposals.len()];
+            for g in &grps {
+                for &idx in &g.members {
+                    prop_color[idx] = g.color;
+                }
+            }
+            for (idx, p) in a.proposals.iter().enumerate() {
                 if self.editor.presence(a.item, p) == Presence::On {
                     let approved = r.approved.contains(&(a.item, p.id.clone()));
-                    out.extend(self.editor.timeline_ranges(a.item, p).into_iter().map(|(s, e)| (s, e, approved)));
+                    let color = prop_color[idx];
+                    out.extend(self.editor.timeline_ranges(a.item, p).into_iter().map(|(s, e)| (s, e, approved, color)));
                 }
             }
         }
@@ -146,8 +156,33 @@ impl SimpleCutApp {
         let Some(lane) = g.lanes.first() else { return Vec::new() };
         self.review_ranges()
             .into_iter()
-            .map(|(s, e, _)| egui::Rect::from_min_max(egui::pos2(g.axis.x_of(s), lane.top()), egui::pos2(g.axis.x_of(e), lane.bottom())))
+            .map(|(s, e, _, _)| egui::Rect::from_min_max(egui::pos2(g.axis.x_of(s), lane.top()), egui::pos2(g.axis.x_of(e), lane.bottom())))
             .collect()
+    }
+
+    /// Colour indexes of the suggestion markers on the timeline in the same order as [`review_marker_rects`].
+    pub fn review_marker_colors(&self) -> Vec<usize> {
+        self.review_ranges().into_iter().map(|(_, _, _, c)| c).collect()
+    }
+
+    /// Groups currently visible in the live review list: (label, colour_index, [suggestion id]).
+    /// Groups with only Off suggestions are omitted.
+    pub fn review_groups(&self) -> Vec<(String, usize, Vec<String>)> {
+        let Some(r) = &self.retakes.review else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for a in &r.analyses {
+            let grps = retake::groups_with_offset(a, offset);
+            offset += grps.len();
+            for g in grps {
+                let on_ids: Vec<String> =
+                    g.members.iter().map(|&idx| &a.proposals[idx]).filter(|p| self.editor.presence(a.item, p) == Presence::On).map(|p| p.id.clone()).collect();
+                if !on_ids.is_empty() {
+                    out.push((g.label, g.color, on_ids));
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn perform_retake(&mut self, action: Action) {
@@ -169,6 +204,17 @@ impl SimpleCutApp {
                     let key = (item, id);
                     if !r.approved.remove(&key) {
                         r.approved.insert(key);
+                    }
+                }
+            }
+            Action::ToggleGroup { item, ids, approve } => {
+                if let Some(r) = &mut self.retakes.review {
+                    for id in ids {
+                        if approve {
+                            r.approved.insert((item, id));
+                        } else {
+                            r.approved.remove(&(item, id));
+                        }
                     }
                 }
             }
@@ -353,6 +399,17 @@ impl SimpleCutApp {
 
 // ── the review column ──────────────────────────────────────────────────────
 
+struct GroupView {
+    item: ItemId,
+    key: String,
+    label: String,
+    color: Color32,
+    members: Vec<Row>,
+    kept: Option<String>,
+    start: Tick,
+    end: Tick,
+}
+
 struct Row {
     item: ItemId,
     id: String,
@@ -409,43 +466,57 @@ pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
 
     let fps = app.editor.sequence().map_or(30.0, |s| s.fps);
     let many = app.retakes.review.as_ref().is_some_and(|r| r.analyses.len() > 1);
-    let (on_rows, off_rows, ignored): (Vec<Row>, Vec<Row>, Vec<(String, String)>) = match &app.retakes.review {
+    let (live_groups, off_rows, ignored): (Vec<GroupView>, Vec<Row>, Vec<(String, String)>) = match &app.retakes.review {
         Some(r) => {
-            let mut on_rows = Vec::new();
+            let mut live_groups = Vec::new();
             let mut off_rows = Vec::new();
+            let mut offset = 0;
             for a in &r.analyses {
                 let file = many.then(|| app.editor.media_entry(a.item).map(|m| m.name)).flatten();
-                for p in &a.proposals {
-                    let on = app.editor.presence(a.item, p) == Presence::On;
-                    let is_removed = r.applied.contains(&(a.item, p.id.clone())) || !app.editor.is_outside_used(a.item, p);
-                    let row = Row {
-                        item: a.item,
-                        id: p.id.clone(),
-                        start: p.start,
-                        end: p.end,
-                        confidence: p.confidence,
-                        decision: p.decision,
-                        reason: p.reason.clone(),
-                        removed: p.removed_text.clone(),
-                        kept: p.kept_text.clone(),
-                        approved: r.approved.contains(&(a.item, p.id.clone())),
-                        is_removed,
-                        file: file.clone(),
-                    };
-                    if on {
-                        on_rows.push(row);
-                    } else {
-                        off_rows.push(row);
+                let grps = retake::groups_with_offset(a, offset);
+                offset += grps.len();
+                for g in grps {
+                    let mut group_on = Vec::new();
+                    let kept = g.members.iter().map(|&idx| &a.proposals[idx].kept_text).find(|t| !t.trim().is_empty()).cloned();
+                    for &idx in &g.members {
+                        let p = &a.proposals[idx];
+                        let on = app.editor.presence(a.item, p) == Presence::On;
+                        let is_removed = r.applied.contains(&(a.item, p.id.clone())) || !app.editor.is_outside_used(a.item, p);
+                        let row = Row {
+                            item: a.item,
+                            id: p.id.clone(),
+                            start: p.start,
+                            end: p.end,
+                            confidence: p.confidence,
+                            decision: p.decision,
+                            reason: p.reason.clone(),
+                            removed: p.removed_text.clone(),
+                            kept: p.kept_text.clone(),
+                            approved: r.approved.contains(&(a.item, p.id.clone())),
+                            is_removed,
+                            file: file.clone(),
+                        };
+                        if on {
+                            group_on.push(row);
+                        } else {
+                            off_rows.push(row);
+                        }
+                    }
+                    if !group_on.is_empty() {
+                        let start = group_on.iter().map(|m| m.start).min().unwrap_or(Tick::ZERO);
+                        let end = group_on.iter().map(|m| m.end).max().unwrap_or(Tick::ZERO);
+                        let color = theme::GROUP_COLORS[g.color % theme::GROUP_COLORS.len()];
+                        live_groups.push(GroupView { item: a.item, key: g.key, label: g.label, color, members: group_on, kept, start, end });
                     }
                 }
             }
-            (on_rows, off_rows, r.rejected())
+            (live_groups, off_rows, r.rejected())
         }
         None => return,
     };
 
-    let total = on_rows.len();
-    let approved = on_rows.iter().filter(|r| r.approved).count();
+    let total: usize = live_groups.iter().map(|g| g.members.len()).sum();
+    let approved: usize = live_groups.iter().flat_map(|g| &g.members).filter(|m| m.approved).count();
 
     if total == 0 {
         ui.label(RichText::new("Everything in this list is already removed. Ctrl+Z brings it back.").color(t.text_dim));
@@ -464,50 +535,123 @@ pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
 
     let list_height = (ui.available_height() - 64.0).max(80.0);
     egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
-        for row in &on_rows {
-            egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
-                ui.set_width(ui.available_width());
+        for group in &live_groups {
+            let id = ui.make_persistent_id(format!("retake_group_{}_{}", group.item.0, group.key));
+            let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+
+            let count = group.members.len();
+            let on_member_ids: Vec<String> = group.members.iter().map(|m| m.id.clone()).collect();
+            let all_approved = group.members.iter().all(|m| m.approved);
+            let some_approved = group.members.iter().any(|m| m.approved);
+            let indeterminate = !all_approved && some_approved;
+            let group_label = group.label.clone();
+            let group_key = group.key.clone();
+            let group_color = group.color;
+            let item = group.item;
+
+            let mut toggle_group_action = None;
+            let mut title_clicked = false;
+
+            let mut res = state.show_header(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let mut checked = row.approved;
-                    let label = format!("{} – {}", format::timecode(row.start, fps), format::timecode(row.end, fps));
-                    let r = ui.checkbox(&mut checked, label);
-                    r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, row.approved, format!("Select suggestion {}", row.id)));
-                    if r.clicked() {
-                        app.queue(Action::ToggleProposal(row.item, row.id.clone()));
+                    let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, group_color);
+
+                    let title_resp =
+                        ui.add(egui::Label::new(RichText::new(&group_label).strong().color(t.text)).sense(egui::Sense::click())).on_hover_text(&group_key);
+                    if title_resp.clicked() {
+                        title_clicked = true;
                     }
+
+                    let count_text = format!("({} suggestion{})", count, if count == 1 { "" } else { "s" });
+                    ui.label(RichText::new(count_text).color(t.text_dim));
+
+                    let span_text = format!("{} – {}", format::timecode(group.start, fps), format::timecode(group.end, fps));
+                    ui.label(RichText::new(span_text).color(t.text_dim));
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let sure = if row.confidence >= AUTO_APPROVE {
-                            t.accent
-                        } else if row.confidence >= 0.5 {
-                            t.text
-                        } else {
-                            t.text_dim
-                        };
-                        ui.label(RichText::new(format!("{:.0}%", row.confidence * 100.0)).color(sure).strong());
-                        if row.decision == Decision::Review {
-                            ui.label(RichText::new("REVIEW").color(Color32::from_rgb(0xf0, 0xa8, 0x40)).small());
+                        ui.add_space(20.0);
+                        let mut checked = all_approved;
+                        let cb = ui.add(egui::Checkbox::without_text(&mut checked).indeterminate(indeterminate));
+                        let acc_label = format!("Select group {group_label}");
+                        cb.widget_info(move || {
+                            if indeterminate {
+                                WidgetInfo::labeled(WidgetType::Checkbox, true, acc_label.clone())
+                            } else {
+                                WidgetInfo::selected(WidgetType::Checkbox, true, checked, acc_label.clone())
+                            }
+                        });
+                        if cb.clicked() {
+                            toggle_group_action = Some(Action::ToggleGroup { item, ids: on_member_ids.clone(), approve: !all_approved });
                         }
                     });
                 });
-                if let Some(file) = &row.file {
-                    ui.label(RichText::new(file).color(t.text_dim).small());
+            });
+
+            if title_clicked {
+                res.toggle();
+            }
+            if let Some(act) = toggle_group_action {
+                app.queue(act);
+            }
+
+            let (toggle_btn, _, _) = res.body(|ui| {
+                if let Some(kept) = &group.kept {
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(format!("Keeps: “{}”", shorten(kept, 120))).color(t.text));
+                    ui.add_space(2.0);
                 }
-                if !row.reason.is_empty() {
-                    ui.label(RichText::new(&row.reason).color(t.text_dim));
-                }
-                if !row.removed.is_empty() {
-                    ui.label(RichText::new(format!("Cut: “{}”", shorten(&row.removed, 120))).color(t.danger));
-                }
-                if !row.kept.is_empty() {
-                    ui.label(RichText::new(format!("Keeps: “{}”", shorten(&row.kept, 120))).color(t.text));
-                }
-                let go = ui.small_button("Go to").on_hover_text("Move the playhead here");
-                go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Go to {}", row.id)));
-                if go.clicked() {
-                    app.queue(Action::GoToProposal(row.item, row.id.clone()));
+
+                for row in &group.members {
+                    let frame_resp = egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            let mut checked = row.approved;
+                            let label = format!("{} – {}", format::timecode(row.start, fps), format::timecode(row.end, fps));
+                            let r = ui.checkbox(&mut checked, label);
+                            r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, row.approved, format!("Select suggestion {}", row.id)));
+                            if r.clicked() {
+                                app.queue(Action::ToggleProposal(row.item, row.id.clone()));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let sure = if row.confidence >= AUTO_APPROVE {
+                                    t.accent
+                                } else if row.confidence >= 0.5 {
+                                    t.text
+                                } else {
+                                    t.text_dim
+                                };
+                                ui.label(RichText::new(format!("{:.0}%", row.confidence * 100.0)).color(sure).strong());
+                                if row.decision == Decision::Review {
+                                    ui.label(RichText::new("REVIEW").color(Color32::from_rgb(0xf0, 0xa8, 0x40)).small());
+                                }
+                            });
+                        });
+                        if let Some(file) = &row.file {
+                            ui.label(RichText::new(file).color(t.text_dim).small());
+                        }
+                        if !row.reason.is_empty() {
+                            ui.label(RichText::new(&row.reason).color(t.text_dim));
+                        }
+                        if !row.removed.is_empty() {
+                            ui.label(RichText::new(format!("Cut: “{}”", shorten(&row.removed, 120))).color(t.danger));
+                        }
+                        let go = ui.small_button("Go to").on_hover_text("Move the playhead here");
+                        go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Go to {}", row.id)));
+                        if go.clicked() {
+                            app.queue(Action::GoToProposal(row.item, row.id.clone()));
+                        }
+                    });
+
+                    let r = frame_resp.response.rect;
+                    let stripe = egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 4.0, r.bottom()));
+                    ui.painter().rect_filled(stripe, CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }, group_color);
+
+                    ui.add_space(4.0);
                 }
             });
-            ui.add_space(4.0);
+            toggle_btn.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("Group {group_label}")));
+            ui.add_space(6.0);
         }
 
         if !off_rows.is_empty() {

@@ -21,7 +21,7 @@ pub use error::{EditorError, Result};
 pub use export::{ExportJob, ExportOptions, ExportState, verify_export};
 pub use player::{AudioOutput, FillFn, PlayState, Player};
 pub use renderer::{PreviewRenderer, RenderedFrame};
-pub use retake::{Analysis, ApplyReport, CutProposal, CutScope, Decision, Presence, Rejected, RetakeDocument};
+pub use retake::{Analysis, ApplyReport, CutProposal, CutScope, Decision, Group, Presence, Rejected, RetakeDocument, groups, groups_with_offset};
 pub use snapshot::{PreviewFrame, Snapshot, Target};
 pub use thumbnails::Thumbnails;
 pub use view::{ClipView, ImportReport, MediaEntry, SequenceView, TrackView};

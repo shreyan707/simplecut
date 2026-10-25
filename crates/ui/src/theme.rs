@@ -40,6 +40,18 @@ pub fn tokens() -> Tokens {
     DARK
 }
 
+/// Eight distinct colors for retake groups, clearly readable on dark panels and distinct from danger/accent.
+pub const GROUP_COLORS: [Color32; 8] = [
+    Color32::from_rgb(245, 158, 11), // Amber / Gold
+    Color32::from_rgb(16, 185, 129), // Emerald
+    Color32::from_rgb(168, 85, 247), // Violet
+    Color32::from_rgb(6, 182, 212),  // Cyan
+    Color32::from_rgb(217, 70, 239), // Magenta
+    Color32::from_rgb(132, 204, 22), // Lime
+    Color32::from_rgb(20, 184, 166), // Teal
+    Color32::from_rgb(249, 115, 22), // Orange
+];
+
 /// Apply the dark theme to the whole app.
 pub fn apply(ctx: &egui::Context) {
     let t = DARK;

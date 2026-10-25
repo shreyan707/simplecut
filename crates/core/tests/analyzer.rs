@@ -80,9 +80,9 @@ fn the_stand_in_detector_reports_progress_and_returns_a_document_the_editor_acce
     assert!(fractions.windows(2).all(|w| w[0] <= w[1]), "progress only goes forward: {fractions:?}");
     let JobState::Done(json) = end else { panic!("not done: {end:?}") };
     let a = e.read_analysis(&json, items[0]).unwrap();
-    assert_eq!(a.proposals.len(), 3);
+    assert_eq!(a.proposals.len(), 4);
     assert!(a.rejected.is_empty());
-    assert_eq!(a.proposals[1].decision, Decision::Review);
+    assert_eq!(a.proposals[2].decision, Decision::Review);
 }
 
 #[test]

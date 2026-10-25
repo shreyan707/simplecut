@@ -97,6 +97,12 @@ pub enum Action {
     LoadAnalysis(PathBuf),
     /// Select or deselect one suggestion.
     ToggleProposal(ItemId, String),
+    /// Select or deselect every proposal in a group.
+    ToggleGroup {
+        item: ItemId,
+        ids: Vec<String>,
+        approve: bool,
+    },
     /// Select what the detector is sure about.
     ApproveSure,
     ApproveNone,
@@ -364,6 +370,7 @@ impl SimpleCutApp {
             | Action::OpenAnalysisFile
             | Action::LoadAnalysis(_)
             | Action::ToggleProposal(..)
+            | Action::ToggleGroup { .. }
             | Action::ApproveSure
             | Action::ApproveNone
             | Action::GoToProposal(..)
@@ -1136,17 +1143,17 @@ impl SimpleCutApp {
 
         egui::Panel::top("toolbar").show(ui, |ui| toolbar::show(self, ui));
         egui::Panel::bottom("status").show_separator_line(false).exact_size(28.0).show(ui, |ui| crate::status::show(self, ui));
+        if self.retakes.visible() {
+            egui::Panel::right("retakes").resizable(true).default_size(340.0).min_size(260.0).show(ui, |ui| {
+                ui.add_enabled_ui(!self.is_exporting(), |ui| retakes::panel(self, ui));
+            });
+        }
         egui::Panel::bottom("timeline").resizable(true).default_size(250.0).min_size(170.0).show(ui, |ui| {
             ui.add_enabled_ui(!self.is_exporting(), |ui| timeline::show(self, ui));
         });
         egui::Panel::left("library").resizable(true).default_size(330.0).min_size(240.0).show(ui, |ui| {
             ui.add_enabled_ui(!self.is_exporting(), |ui| library::show(self, ui));
         });
-        if self.retakes.visible() {
-            egui::Panel::right("retakes").resizable(true).default_size(340.0).min_size(260.0).show(ui, |ui| {
-                ui.add_enabled_ui(!self.is_exporting(), |ui| retakes::panel(self, ui));
-            });
-        }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_enabled_ui(!self.is_exporting(), |ui| preview::show(self, ui));
         });

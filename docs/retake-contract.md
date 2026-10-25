@@ -59,7 +59,7 @@ The editor's side is `crates/core/src/retake.rs` (parsing, validation, applying)
 | `removed_text`, `kept_text` | `""` | What is cut and what stays instead, for the review list. |
 | `kept_start`, `kept_end` | none | Where the kept take is, so the editor can jump to it. |
 | `source` | none | `"stage2"`, `"llm"`, `"rule"`... free text, shown as a tag. |
-| `group` | none | Proposals of the same retake group share it (for example the span id). |
+| `group` | none | Suggestions of one retake share it (typically the discarded takes before the same kept take). A suggestion without a group is its own group. |
 | `generator`, `transcript` | none | Recorded with the result. The transcript is not used for cutting yet. |
 
 Unknown fields are ignored, so the pipeline may add its own. Never reuse a field name for a different meaning; changing a meaning needs `.../2`.
