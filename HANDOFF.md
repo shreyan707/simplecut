@@ -206,3 +206,85 @@ The owner has not run the pipeline end to end (it is still being trained and ret
 - **By hand, no detector needed:** Ctrl+Shift+R (Action `OpenAnalysisFile`, `Dialogs::pick_analysis_file`) loads a JSON analysis file; the project file is found by length, then by file name (`Editor::find_media_for`). To see the whole flow in the real app: set the environment variable `SIMPLECUT_FAKE_RETAKES=1` before running `simplecut`.
 - **Tests (119 in all):** core `tests/analyzer.rs`, `tests/retake.rs`; UI `tests/retake_window.rs` (button visibility, find/review/apply/undo with exact source offsets, toggles, go-to, close, cancel, failure, wrong file, loading files).
 - **Left for step 8:** a real `Analyzer` that talks to the pipeline (local service per section 9), registered in `apps/simplecut/src/main.rs` in place of the `SIMPLECUT_FAKE_RETAKES` demo hook. Everything else is in place; a real detector only has to return a document in `docs/retake-contract.md`.
+
+## 14. NEXT WORK (assigned to the coding agent): make the review follow the timeline, then add colour-coded groups
+
+The owner tested the app by hand. Everything worked except the retake review. A reviewer (the person who wrote step 7) will check this work afterwards; read "Reviewer will check" at the end before you start.
+
+### 14.1 What the owner saw, and what is actually wrong
+
+Reproduced on the real code with a throwaway test (not committed). Scenario: connect the demo detector, put `talk.mp4` (4 s) on the timeline, click Remove Retakes, then "Remove 2 retakes":
+
+| Step | What happens now | What should happen |
+|---|---|---|
+| after "Remove 2 retakes" | the list keeps only the unselected one: `(1 suggestion, 0 selected)` | the two applied ones stay in the list, shown as removed |
+| **Undo (Ctrl+Z) with the review open** | the list is still `(1, 0)`; the two undone ones **do not come back** | they come back, ticked as before (BUG 2, owner report #2) |
+| click Remove Retakes **again** on the already-cut video | the detector reports against the *source file*, so the same 3 suggestions are listed and 2 are pre-selected; 2 markers are drawn, one of them a **13 ms sliver** where frame rounding left a bit of a removed suggestion; applying shows the error "None of those cuts falls inside the part of the file that is on the timeline." | suggestions whose video is already cut out are recognised, shown as "already removed", not selected, no marker, not applicable (BUG 1, owner report #1: "removed retake parts are shown, I cannot remove them") |
+
+Root cause of both: the review list is a **fixed copy** that the apply step edits (`apply_retakes` deletes the applied items and clears the selection), instead of a **view of the live timeline**. The mapping from file time to timeline time (`Editor::timeline_ranges`) already follows the timeline, so use it as the single source of truth.
+
+Real detectors will behave like the demo one: they analyse the file, not the edit, so re-running always re-reports retakes that were already cut. This is a real concern, not a test artefact. The old tests missed it because they only checked that the timeline came back after Undo, never the list.
+
+### 14.2 Task A: the review is a live view (fixes both bugs)
+
+Files: `crates/ui/src/retakes.rs` (most of it), small helpers in `crates/core/src/retake.rs`, `crates/ui/src/timeline.rs` (markers), `crates/ui/src/app.rs` only if needed.
+
+1. **Presence is derived every frame and never stored as a deletion.** For each suggestion compute how much of it is on the timeline now: the total length of `Editor::timeline_ranges(item, p)` compared with the suggestion's own length. Add a core function (headless-testable), for example `Editor::presence(item, &CutProposal) -> Presence { On, Off }`, where `Off` means covered less than max(one frame of the sequence, 10 % of the suggestion). This also removes the sliver problem (a 13 ms leftover counts as off).
+2. **Never delete suggestions from the review after applying.** Remove the `retain` loop, the `approved.clear()` and the auto-close in `apply_retakes`. After applying, the applied suggestions become `Off` by themselves because the timeline no longer shows them. **Keep their approval flag**, so that Undo (which makes them `On` again) brings them back ticked exactly as before, and Redo makes them `Off` again.
+3. **Off suggestions** are: not counted in "N possible retakes" or "N selected"; not drawn as markers; not included in "Select sure ones"; not applied; their checkbox is disabled. Show them in a collapsed section at the bottom, "Already removed or not on the timeline (n)", greyed. Two wordings: "Already removed" if the suggestion was `On` when the review was created or has been seen `On` since; otherwise "Outside the part of the video you used". Track this with a `seen_on: bool` per suggestion.
+4. **Counts and the button** use only suggestions that are `On` and approved. The "Remove N retakes" button is disabled at N = 0. The error "None of those cuts…" then cannot be reached from the button any more (keep the core error for other callers).
+5. **When nothing is `On`** (everything was removed, or a re-run found only things already cut) show in the panel: "Everything in this list is already removed. Ctrl+Z brings it back." and keep the Close button. Do not auto-close.
+6. **Re-running** Remove Retakes replaces the review with the new result. Suggestions already cut appear in the collapsed section, unselected (auto-approval applies only to `On` suggestions). The banner says, for example, "Found 3 possible retakes (2 already removed); 1 selected."
+7. **Close** keeps working: it drops the review and all markers.
+8. Edits made while the review is open (trim, move, split, undo) must show on the next frame, because everything is recomputed from the timeline. Do not cache presence across frames unless the cache is keyed by `editor.session().revision`.
+
+Tests to add. Write the first three first and confirm they **fail on the current code**:
+- apply, then Undo with the review open: the two suggestions are back, `On`, still ticked, markers drawn again; Redo: gone again.
+- apply, then re-run the analysis: all three listed, the two cut ones in the "already removed" section, none selected, no markers (so no sliver), the Remove button disabled, no error banner.
+- the sliver case on its own: a suggestion that is more than 90 % cut is `Off` and has no marker.
+- trim the clip so a suggestion falls outside the used part: it moves to "Outside the part of the video you used"; trimming back (Undo) returns it.
+- counts: "N selected" and the button label ignore `Off` suggestions.
+- unit tests for `presence` in core, including speed-changed and frame-hold clips (they have no mapped ranges, so `Off`; make sure that is reported sensibly, not as "already removed").
+
+### 14.3 Task B: colour-coded groups with a drop-down per group
+
+The contract already has the optional field `group` (suggestions of one retake share it; typically the discarded takes before the same kept take). No schema change is needed. Update the wording in `docs/retake-contract.md` to say exactly that, and that a suggestion without `group` is its own group.
+
+Core (headless): in `crates/core/src/retake.rs` add
+
+```
+pub struct Group { pub key: String, pub label: String, pub color: usize, pub members: Vec<usize> /* indexes into Analysis.proposals, ordered by start */ }
+pub fn groups(analysis: &Analysis) -> Vec<Group>
+```
+- key = the proposal `group`, or a unique key made from its id when it has none (a group of one);
+- groups ordered by the earliest start of any member; `label` = "Retake 1", "Retake 2", … in that order (friendly; the raw `group` string goes in a tooltip);
+- `color` = position in that order modulo the palette size, so colours are stable while the review is open and never depend on hashing;
+- with several files in one review, order groups per file and keep numbering and colours continuing across the whole review.
+
+UI (`retakes.rs`, `theme.rs`, `timeline.rs`):
+- `theme.rs`: a palette `GROUP_COLORS` of 8 colours that are clearly different from each other and readable on the dark panel (check against `panel_raised`); avoid the red used for danger and the blue accent used for selection.
+- The review list becomes a list of **groups**. Each group is an `egui::CollapsingHeader` (the drop-down), **open by default**, whose title row has a colour dot, the label ("Retake 2"), the count ("2 suggestions"), the time span it covers, and a **tri-state checkbox** (all / some / none of its `On` members approved) that ticks or unticks every `On` member at once. Accessible labels: header "Group Retake 2", checkbox "Select group Retake 2".
+- Inside the group: the member rows as today (checkbox, confidence, REVIEW tag, reason, Cut text, Go to) with a thin left stripe in the group colour. The kept take ("Keeps: …") is shown **once at the group level** (the first non-empty `kept_text` among the members) instead of on every row.
+- Timeline markers use the group colour (fill and outline) instead of the fixed red: approved = stronger, not approved = faint, as now.
+- Test hooks, so tests need not read pixels: `SimpleCutApp::review_groups() -> Vec<(label, colour_index, Vec<suggestion id>)>` and `review_marker_colors() -> Vec<usize>` (colour index per marker, same order as `review_marker_rects()`).
+- `FakeAnalyzer`: give it a group that has **two** members (for example add `fake_0:1`, a second discarded take of group `fake_0`) so groups with more than one member can be tested; keep a singleton group and the `review` one. Update every existing test whose counts change, and say so in the commit message. Do not weaken assertions to make them pass.
+
+Tests to add: core `groups()` (ordering, singleton without `group`, label numbering, colour modulo, multi-file continuation, determinism); window tests (headers present with the right labels and counts, collapsing hides the rows, the group checkbox toggles all members and shows the in-between state, colours of rows and markers match per group, groups of `Off` suggestions are not in the live list, Undo/Redo from Task A keeps group state).
+
+### 14.4 Rules for you
+
+- Keep the gates green. Commit once per task (A, then B) in the usual message style with the attribution line. Update section 13 of this file when done (what changed, new test names, new hooks).
+- Do not change the contract field names or meanings, only clarify wording. Do not touch FilmCraft.
+- Prefer small, pure, tested functions in core over logic inside egui closures.
+- Run the full workspace tests at least 3 times in a row before saying "done"; a flaky test counts as a failure. Tests that need a moment (analysis, thumbnails) must wait for the specific state with `step_until`, never accept "any state".
+- If something in this section is impossible or a better design exists, say so in your final message instead of silently doing something different.
+
+### 14.5 Reviewer will check (so you can check it first)
+
+1. The three "must fail before" tests really fail on the old code (check by stashing the fix) and pass after.
+2. Undo and Redo with the review open behave as in the table above, and no suggestion can ever be applied twice.
+3. No stored copy of "what is on the timeline" can go stale: presence is recomputed from the live timeline.
+4. No `unwrap`, `expect` or `panic` in product code; no assertion weakened (search the diff for removed or loosened asserts, `|| true`, wider tolerances).
+5. Group colours are stable, distinct and identical in the list and on the timeline; the tri-state checkbox is right for none, some and all.
+6. The real app still launches with `SIMPLECUT_FAKE_RETAKES=1`, and the manual flow works: analyse, review, apply, Undo with the panel open, analyse again.
+7. `HANDOFF.md` section 13 is accurate afterwards.
