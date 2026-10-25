@@ -281,8 +281,20 @@ impl Editor {
         &self.session.state.selection
     }
 
+    /// Select clips, and with them whatever moves with them (a picture's own sound), so what is
+    /// highlighted is what an edit will act on.
     pub fn select(&mut self, clips: &[ClipId]) -> Result<()> {
-        let ids: Vec<u64> = clips.iter().map(|c| c.0).collect();
+        let mut ids: Vec<u64> = clips.iter().map(|c| c.0).collect();
+        if let Some(q) = self.session.active_sequence() {
+            let links: Vec<u64> = clips.iter().filter_map(|c| q.find_item(*c).and_then(|(_, it)| it.link)).collect();
+            for t in q.video_tracks.iter().chain(q.audio_tracks.iter()) {
+                for c in &t.items {
+                    if c.link.is_some_and(|l| links.contains(&l)) && !ids.contains(&c.id.0) {
+                        ids.push(c.id.0);
+                    }
+                }
+            }
+        }
         self.session.execute("timeline.select", json!({"clips": ids}))?;
         Ok(())
     }
@@ -440,6 +452,24 @@ impl Editor {
         }
         self.require_clip(clip)?;
         self.session.execute("clip.audioGain", json!({"clips": [clip.0], "mode": "set", "db": db.clamp(-60.0, 24.0)}))?;
+        Ok(())
+    }
+
+    /// Set the volume of every audio clip among `clips` in one step. Clips on the video track are
+    /// skipped (their sound is the linked clip on the dialogue track).
+    pub fn set_clips_gain_db(&mut self, clips: &[ClipId], db: f64) -> Result<()> {
+        if !db.is_finite() {
+            return Err(EditorError::Invalid("Volume must be a number.".into()));
+        }
+        let audio: Vec<ClipId> = {
+            let q = self.session.active_sequence().ok_or(EditorError::NoSequence)?;
+            q.audio_tracks.iter().flat_map(|t| t.items.iter()).filter(|c| clips.contains(&c.id)).map(|c| c.id).collect()
+        };
+        if audio.is_empty() {
+            return Err(EditorError::NotAvailable("Select a clip with sound first.".into()));
+        }
+        let ids: Vec<u64> = audio.iter().map(|c| c.0).collect();
+        self.session.execute("clip.audioGain", json!({"clips": ids, "mode": "set", "db": db.clamp(-60.0, 24.0)}))?;
         Ok(())
     }
 

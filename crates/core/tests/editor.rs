@@ -426,3 +426,34 @@ fn mp3_music_imports_and_places() {
     e.place(song, Lane::Music, PlaceAt::At(Tick::ZERO)).unwrap();
     assert_eq!(track(&e.sequence().unwrap(), "Music").clips.len(), 1);
 }
+
+#[test]
+fn selecting_a_clip_selects_what_moves_with_it_and_volume_applies_to_the_group() {
+    let Some(fx) = fx("select") else { return };
+    let (mut e, _) = project_with_clip(&fx, 4);
+    let v = e.sequence().unwrap();
+    let picture = track(&v, "Video").clips[0].id;
+    let sound = track(&v, "Dialogue").clips[0].id;
+
+    e.select(&[picture]).unwrap();
+    let mut sel = e.selection().to_vec();
+    sel.sort_by_key(|c| c.0);
+    let mut both = vec![picture, sound];
+    both.sort_by_key(|c| c.0);
+    assert_eq!(sel, both, "the picture's own sound is selected with it");
+    let v = e.sequence().unwrap();
+    assert!(v.clip(picture).unwrap().selected && v.clip(sound).unwrap().selected);
+
+    // volume: the picture is skipped, its sound changes, in one undo step
+    let selection = e.selection().to_vec();
+    e.set_clips_gain_db(&selection, -9.0).unwrap();
+    let v = e.sequence().unwrap();
+    assert_eq!(v.clip(sound).unwrap().gain_db, -9.0);
+    e.undo().unwrap();
+    assert_eq!(e.sequence().unwrap().clip(sound).unwrap().gain_db, 0.0);
+
+    e.select(&[]).unwrap();
+    assert!(e.selection().is_empty());
+    assert!(matches!(e.set_clips_gain_db(&[picture], -3.0), Err(EditorError::NotAvailable(_))), "a picture alone has no volume");
+    assert!(matches!(e.set_clips_gain_db(&[sound], f64::NAN), Err(EditorError::Invalid(_))));
+}

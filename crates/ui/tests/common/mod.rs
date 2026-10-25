@@ -1,6 +1,8 @@
 //! Fixtures for the window tests: small media made with ffmpeg (a test-only oracle).
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod harness;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};

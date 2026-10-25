@@ -12,6 +12,7 @@ mod status;
 mod status_text;
 mod theme;
 mod timeline;
+mod tl_math;
 mod toolbar;
 
 pub use app::{Action, Banner, SimpleCutApp, Source};

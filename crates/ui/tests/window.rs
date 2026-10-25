@@ -7,97 +7,12 @@
 
 mod common;
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use common::{have, make_clip, make_music, scratch};
-use egui_kittest::Harness;
+use common::harness::{Script, click, item, secs, skip, step_until, window, with_media};
 use egui_kittest::kittest::{NodeT, Queryable};
-use simplecut_core::{ItemId, Lane, Tick};
-use simplecut_ui::{Action, Dialogs, SimpleCutApp, Source};
-
-/// Dialogs that answer from a script.
-#[derive(Clone, Default)]
-struct Script {
-    media: Arc<Mutex<VecDeque<Vec<PathBuf>>>>,
-    open: Arc<Mutex<VecDeque<PathBuf>>>,
-    save: Arc<Mutex<VecDeque<PathBuf>>>,
-}
-
-impl Dialogs for Script {
-    fn pick_media(&self) -> Vec<PathBuf> {
-        self.media.lock().unwrap().pop_front().unwrap_or_default()
-    }
-
-    fn pick_project_to_open(&self) -> Option<PathBuf> {
-        self.open.lock().unwrap().pop_front()
-    }
-
-    fn pick_project_save_path(&self, _suggested_name: &str) -> Option<PathBuf> {
-        self.save.lock().unwrap().pop_front()
-    }
-}
-
-type Window = Harness<'static, SimpleCutApp>;
-
-fn window(script: Script) -> Window {
-    let mut h = Harness::builder()
-        .with_size(egui::vec2(1300.0, 820.0))
-        .with_max_steps(10_000)
-        .build_eframe(move |cc| SimpleCutApp::new(&cc.egui_ctx, Box::new(script), None));
-    h.step();
-    h
-}
-
-/// Keep drawing frames until `cond` holds.
-fn step_until(h: &mut Window, what: &str, mut cond: impl FnMut(&SimpleCutApp) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        h.step();
-        if cond(h.state()) {
-            return;
-        }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn click(h: &mut Window, label: &str) {
-    // a window that just opened lays itself out one frame late: let it settle before aiming at it
-    h.step();
-    h.get_by_label(label).click();
-    h.step();
-    h.step();
-}
-
-fn secs(s: f64) -> Tick {
-    Tick::from_seconds_f64(s)
-}
-
-fn skip() -> bool {
-    let missing = !have("ffmpeg") || !have("ffprobe");
-    if missing {
-        eprintln!("SKIPPED: ffmpeg / ffprobe are not installed");
-    }
-    missing
-}
-
-/// A window with a 4 s clip and a 6 s music file imported through the Import button.
-fn with_media() -> (Window, Script, PathBuf) {
-    let dir = scratch("window");
-    let script = Script::default();
-    script.media.lock().unwrap().push_back(vec![make_clip(&dir, "talk.mp4", 4), make_music(&dir, "bed.wav", 6)]);
-    let mut h = window(script.clone());
-    click(&mut h, "Import");
-    step_until(&mut h, "the import", |a| a.editor().media().len() == 2);
-    (h, script, dir)
-}
-
-fn item(h: &Window, name: &str) -> ItemId {
-    h.state().editor().media().iter().find(|m| m.name == name).unwrap_or_else(|| panic!("no media {name}")).id
-}
+use simplecut_core::{Lane, Tick};
+use simplecut_ui::{Action, Source};
 
 #[test]
 fn a_new_window_starts_on_an_empty_project() {

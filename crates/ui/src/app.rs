@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use egui::{Align2, Key, Modifiers};
 use simplecut_core::{
-    AudioOutput, Editor, EditorError, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player, PreviewFrame, PreviewRenderer, Snapshot, Target,
-    Thumbnails, Tick,
+    AudioOutput, ClipId, Edge, Editor, EditorError, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player, PreviewFrame, PreviewRenderer, Snapshot,
+    Target, Thumbnails, Tick, TrackId, TrimMode,
 };
 
 use crate::dialogs::Dialogs;
+use crate::timeline::TimelineUi;
 use crate::{library, preview, theme, timeline, toolbar};
 
 /// What the preview area shows.
@@ -52,6 +53,29 @@ pub enum Action {
     AddToTimeline(ItemId, Lane),
     Split,
     Delete,
+    /// Select clips (and what moves with them); `add` toggles them in or out of the selection.
+    SelectClips {
+        clips: Vec<ClipId>,
+        add: bool,
+    },
+    MoveClip {
+        clip: ClipId,
+        to: Tick,
+    },
+    /// Move one end of a clip by `delta` (positive: later). `ripple` closes the gap it leaves.
+    TrimClip {
+        clip: ClipId,
+        edge: Edge,
+        delta: Tick,
+        ripple: bool,
+    },
+    /// Set the volume of the selected clips, in dB.
+    SetClipVolume(f64),
+    SetTrackMuted(TrackId, bool),
+    SetTrackVolume(TrackId, f64),
+    ZoomIn,
+    ZoomOut,
+    ZoomFit,
     DismissBanner,
 }
 
@@ -108,6 +132,7 @@ pub struct SimpleCutApp {
     /// Width in points of the preview area as last drawn, to pick a picture size.
     pub(crate) preview_width: f32,
 
+    pub(crate) tl: TimelineUi,
     pub(crate) banner: Option<Banner>,
     modal: Option<Modal>,
     close_now: bool,
@@ -137,6 +162,7 @@ impl SimpleCutApp {
             preview_texture: None,
             last_asked: None,
             preview_width: 640.0,
+            tl: TimelineUi::default(),
             banner,
             modal: None,
             close_now: false,
@@ -296,8 +322,88 @@ impl SimpleCutApp {
                     self.info("Deleted the selected clips.");
                 }
             }
+            Action::SelectClips { clips, add } => {
+                let new = if add {
+                    let current = self.editor.selection().to_vec();
+                    let group: Vec<ClipId> = clips.iter().flat_map(|c| self.linked_group(*c)).collect();
+                    if !group.is_empty() && group.iter().all(|g| current.contains(g)) {
+                        current.into_iter().filter(|c| !group.contains(c)).collect()
+                    } else {
+                        let mut all = current;
+                        all.extend(clips);
+                        all
+                    }
+                } else {
+                    clips
+                };
+                let r = self.editor.select(&new);
+                self.check(r);
+            }
+            Action::MoveClip { clip, to } => {
+                let r = self.editor.move_clip(clip, to);
+                self.check(r);
+            }
+            Action::TrimClip { clip, edge, delta, ripple } => {
+                let r = self.editor.trim(clip, edge, delta, if ripple { TrimMode::Ripple } else { TrimMode::Regular });
+                self.check(r);
+            }
+            Action::SetClipVolume(db) => {
+                let selection = self.editor.selection().to_vec();
+                let r = self.editor.set_clips_gain_db(&selection, db);
+                self.check(r);
+            }
+            Action::SetTrackMuted(track, muted) => {
+                let r = self.editor.set_track_muted(track, muted);
+                self.check(r);
+            }
+            Action::SetTrackVolume(track, db) => {
+                let r = self.editor.set_track_volume_db(track, db);
+                self.check(r);
+            }
+            Action::ZoomIn => timeline::zoom_by(self, 1.5),
+            Action::ZoomOut => timeline::zoom_by(self, 1.0 / 1.5),
+            Action::ZoomFit => timeline::zoom_fit(self),
             Action::DismissBanner => self.banner = None,
         }
+    }
+
+    /// `clip` and everything that moves with it.
+    fn linked_group(&self, clip: ClipId) -> Vec<ClipId> {
+        let Some(seq) = self.editor.sequence() else { return Vec::new() };
+        let link = seq.clip(clip).and_then(|c| c.link);
+        seq.tracks.iter().flat_map(|t| t.clips.iter()).filter(|c| c.id == clip || (link.is_some() && c.link == link)).map(|c| c.id).collect()
+    }
+
+    // ── where the timeline drew things (for tests) ─────────────────────────
+
+    /// The screen rectangle of a clip as last drawn.
+    pub fn timeline_clip_rect(&self, clip: ClipId) -> Option<egui::Rect> {
+        self.tl.last.as_ref()?.clips.iter().find(|g| g.id == clip).map(|g| g.rect)
+    }
+
+    /// The screen x of a time on the timeline as last drawn.
+    pub fn timeline_x(&self, t: Tick) -> Option<f32> {
+        self.tl.last.as_ref().map(|g| g.axis.x_of(t))
+    }
+
+    /// The screen rectangle of a track's lane (0 = the top one) as last drawn.
+    pub fn timeline_lane(&self, index: usize) -> Option<egui::Rect> {
+        self.tl.last.as_ref()?.lanes.get(index).copied()
+    }
+
+    /// The screen rectangle of the ruler as last drawn.
+    pub fn timeline_ruler(&self) -> Option<egui::Rect> {
+        self.tl.last.as_ref().map(|g| g.ruler)
+    }
+
+    /// Pixels per second of the timeline as last drawn.
+    pub fn timeline_scale(&self) -> Option<f64> {
+        self.tl.last.as_ref().map(|g| g.axis.pps)
+    }
+
+    /// Whether the timeline is zoomed in from "fit".
+    pub fn timeline_zoomed(&self) -> bool {
+        self.tl.zoom.is_some()
     }
 
     fn import(&mut self, paths: Vec<PathBuf>) {
@@ -429,6 +535,7 @@ impl SimpleCutApp {
         self.preview_texture = None;
         self.last_asked = None;
         self.media_cache = (u64::MAX, None, Vec::new());
+        self.tl = TimelineUi::default();
     }
 
     fn new_now(&mut self) {
