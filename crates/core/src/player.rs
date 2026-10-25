@@ -192,16 +192,65 @@ pub struct Player {
     restarts: u32,
     /// Where playback is (or stopped): the sequence playhead, or the position in the media file.
     position: Tick,
+    skips: Vec<(Tick, Tick)>,
+    skips_counted: usize,
 }
 
 impl Player {
     /// A player on `output`, or on the wall clock alone when there is no sound card.
     pub fn new(output: Option<Box<dyn AudioOutput>>) -> Self {
-        Self { output, playing: false, origin: Tick::ZERO, started: None, feeder: None, snapshot: None, restarts: 0, position: Tick::ZERO }
+        Self {
+            output,
+            playing: false,
+            origin: Tick::ZERO,
+            started: None,
+            feeder: None,
+            snapshot: None,
+            restarts: 0,
+            position: Tick::ZERO,
+            skips: Vec::new(),
+            skips_counted: 0,
+        }
     }
 
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    /// How many skips were triggered during playback.
+    pub fn skips(&self) -> usize {
+        self.skips_counted
+    }
+
+    /// Current timeline skip ranges.
+    pub fn current_skips(&self) -> &[(Tick, Tick)] {
+        &self.skips
+    }
+
+    /// Set intervals on the timeline that playback should skip over.
+    ///
+    /// Ranges are filtered to non-empty within valid timeline bounds, sorted,
+    /// merged when touching or overlapping, and capped in quantity.
+    pub fn set_skips(&mut self, skips: Vec<(Tick, Tick)>) {
+        const MAX_SKIPS: usize = 10_000;
+        let mut valid: Vec<(Tick, Tick)> = skips.into_iter().filter(|&(s, e)| s.0 >= 0 && e.0 > s.0).collect();
+        valid.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(Tick, Tick)> = Vec::new();
+        for (s, e) in valid {
+            if let Some(last) = merged.last_mut()
+                && s <= last.1
+            {
+                last.1 = last.1.max(e);
+                continue;
+            }
+            merged.push((s, e));
+        }
+        merged.truncate(MAX_SKIPS);
+        self.skips = merged;
+    }
+
+    fn find_skip(&self, t: Tick) -> Option<(Tick, Tick)> {
+        self.skips.iter().find(|&&(s, e)| s <= t && t < e).copied()
     }
 
     /// How many times playback restarted itself because the project was edited while playing.
@@ -256,9 +305,22 @@ impl Player {
         if end <= Tick::ZERO {
             return Err(EditorError::NotAvailable("The timeline is empty.".into()));
         }
+        self.skips_counted = 0;
         let mut from = editor.playhead();
         if from >= end {
             from = Tick::ZERO;
+            editor.set_playhead(from);
+        }
+        if let Some((_s, e)) = self.find_skip(from) {
+            from = e;
+            self.skips_counted += 1;
+            if from >= end {
+                self.halt();
+                self.playing = false;
+                self.position = end;
+                editor.set_playhead(end);
+                return Ok(());
+            }
             editor.set_playhead(from);
         }
         self.halt();
@@ -298,7 +360,12 @@ impl Player {
     }
 
     /// Move the playhead; playback continues from there when it was playing the sequence.
-    pub fn seek(&mut self, editor: &mut Editor, to: Tick) {
+    pub fn seek(&mut self, editor: &mut Editor, mut to: Tick) {
+        if (matches!(self.target(), Some(Target::Sequence(_))) || self.snapshot.is_none())
+            && let Some((_s, e)) = self.find_skip(to)
+        {
+            to = e;
+        }
         editor.set_playhead(to);
         self.position = editor.playhead();
         if self.playing && !matches!(self.target(), Some(Target::Sequence(_))) {
@@ -327,7 +394,7 @@ impl Player {
             self.halt();
             self.started = Some(Instant::now());
         }
-        let Some(snapshot) = &self.snapshot else {
+        let Some(snapshot) = self.snapshot.clone() else {
             self.playing = false;
             return PlayState::Idle;
         };
@@ -342,6 +409,21 @@ impl Player {
                 editor.set_playhead(end);
             }
             return PlayState::Ended;
+        }
+        if !media && let Some((_s, e)) = self.find_skip(now) {
+            self.skips_counted += 1;
+            if e >= end {
+                self.halt();
+                self.playing = false;
+                self.position = end;
+                editor.set_playhead(end);
+                return PlayState::Ended;
+            }
+            self.halt();
+            self.begin(snapshot.clone(), e);
+            self.position = e;
+            editor.set_playhead(e);
+            return PlayState::Playing;
         }
         self.position = now;
         if media {

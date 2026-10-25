@@ -102,6 +102,7 @@ pub(crate) struct Review {
     /// AI reasons by group id.
     pub reasons: HashMap<String, String>,
     pub ai_consent_pending: bool,
+    pub skip_unticked: bool,
 }
 
 impl Review {
@@ -280,6 +281,14 @@ impl SimpleCutApp {
         }
     }
 
+    /// Whether unticked sentences are skipped during playback.
+    pub fn review_skips_unticked(&self) -> bool {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => r.skip_unticked,
+            _ => false,
+        }
+    }
+
     fn on(&self, item: ItemId, s: &Sentence) -> bool {
         self.editor.presence_of(item, s.start, s.end) == Presence::On
     }
@@ -398,6 +407,11 @@ impl SimpleCutApp {
             }
             Action::ApplyRetakes => self.apply_retakes(),
             Action::CloseReview => self.close_review(),
+            Action::SetSkipUnticked(skip) => {
+                if let Some(Stage::Review(r)) = &mut self.retakes.stage {
+                    r.skip_unticked = skip;
+                }
+            }
             _ => {}
         }
     }
@@ -449,6 +463,7 @@ impl SimpleCutApp {
     }
 
     fn close_review(&mut self) {
+        self.player.set_skips(Vec::new());
         match self.retakes.stage.take() {
             Some(Stage::Analyzing(mut run)) | Some(Stage::Resolving { mut run, .. }) => run.job.cancel(),
             Some(Stage::Review(mut r)) => {
@@ -539,6 +554,7 @@ impl SimpleCutApp {
             notes: Vec::new(),
             reasons: HashMap::new(),
             ai_consent_pending: false,
+            skip_unticked: true,
         };
         self.review_tick(&mut r);
         let handled = r.groups.iter().filter(|g| !self.actionable(item, g)).count();
@@ -804,6 +820,7 @@ impl SimpleCutApp {
                     text.push_str(n);
                 }
                 self.info_text(text);
+                self.player.set_skips(Vec::new());
             }
             Err(e) => self.fail_text(&e.to_string()),
         }
@@ -1068,6 +1085,17 @@ fn review_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
             app.queue(Action::RedoQuestions);
         }
     });
+
+    let mut skip_unticked = app.review_skips_unticked();
+    if ui
+        .checkbox(&mut skip_unticked, "Skip unticked sentences when playing")
+        .on_hover_text(
+            "When checked, playback skips over sentences marked for removal. Music is not cut by Remove, so the preview is approximate for the music bed.",
+        )
+        .changed()
+    {
+        app.queue(Action::SetSkipUnticked(skip_unticked));
+    }
     if pending {
         egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
             ui.label("The sentences of the groups you ask about will be sent to the AI service. Continue?");

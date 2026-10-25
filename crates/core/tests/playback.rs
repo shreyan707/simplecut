@@ -237,3 +237,64 @@ fn playing_needs_something_on_the_timeline() {
     assert!(matches!(p.play(&mut e), Err(EditorError::NotAvailable(_))));
     assert!(!p.is_playing());
 }
+
+#[test]
+fn playback_skips_unticked_sentences_and_handles_edits() {
+    let Some((mut e, _item, _dir)) = project() else { return };
+    let card = Card::new(48_000);
+    let mut p = Player::new(Some(Box::new(card.clone())));
+
+    // Timeline duration is 4.0s.
+    // Three sections: a (0.0..1.0), b (1.0..2.0), c (2.0..4.0).
+    // Only b is kept, so a and c are skipped.
+    p.set_skips(vec![(secs(0.0), secs(1.0)), (secs(2.0), secs(4.0))]);
+
+    // 1. Play from start of a -> jumps over a, plays b, jumps over c, ends.
+    e.set_playhead(secs(0.0));
+    p.play(&mut e).unwrap();
+    // Starting inside skip [0.0, 1.0) jumps playhead to 1.0
+    assert!(within_a_frame(e.playhead(), secs(1.0)), "jumped over a at start: {:?}", e.playhead());
+    assert_eq!(p.skips(), 1);
+
+    // Pump audio for b (1.0s = 48_000 frames)
+    let heard = pump_until(&card, &p, 48_000);
+    assert!(rms(&heard) > 0.03, "b played sound");
+    let state = p.tick(&mut e);
+    // At 2.0s, now enters skip [2.0, 4.0) -> e=4.0 >= end -> ends playback!
+    assert_eq!(state, PlayState::Ended);
+    assert_eq!(p.skips(), 2, "jumped over c and ended");
+    assert_eq!(e.playhead(), secs(4.0));
+
+    // 2. Checkbox off -> no skips
+    p.set_skips(vec![]);
+    e.set_playhead(secs(0.0));
+    p.play(&mut e).unwrap();
+    assert_eq!(e.playhead(), secs(0.0), "starts at 0 when no skips");
+    pump_until(&card, &p, 24_000);
+    p.tick(&mut e);
+    assert!(within_a_frame(e.playhead(), secs(0.5)));
+    assert_eq!(p.skips(), 0, "no skips triggered when skips list is empty");
+    p.pause();
+
+    // 3. Seeking into a range lands at its end
+    p.set_skips(vec![(secs(0.0), secs(1.0)), (secs(2.0), secs(4.0))]);
+    p.seek(&mut e, secs(0.5));
+    assert_eq!(e.playhead(), secs(1.0), "seeking into a lands at 1.0");
+    p.seek(&mut e, secs(2.5));
+    assert_eq!(e.playhead(), secs(4.0), "seeking into c lands at 4.0");
+    p.seek(&mut e, secs(1.5));
+    assert_eq!(e.playhead(), secs(1.5), "seeking into b stays at 1.5");
+
+    // 4. Edits made during playback do not break skipping
+    e.set_playhead(secs(1.0));
+    p.play(&mut e).unwrap();
+    pump_until(&card, &p, 9_600);
+    let dialogue = e.sequence().unwrap().tracks.iter().find(|t| t.name == "Dialogue").unwrap().id;
+    e.set_track_muted(dialogue, true).unwrap();
+    assert_eq!(p.tick(&mut e), PlayState::Playing);
+    assert_eq!(p.restarts(), 1, "restarted on edit");
+    // Pump rest of b up to 2.0s
+    pump_until(&card, &p, 48_000);
+    assert_eq!(p.tick(&mut e), PlayState::Ended);
+    assert_eq!(p.skips(), 1, "c was still skipped after project edit");
+}

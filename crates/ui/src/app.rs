@@ -122,6 +122,7 @@ pub enum Action {
     /// Cut every sentence that is not kept.
     ApplyRetakes,
     CloseReview,
+    SetSkipUnticked(bool),
 }
 
 /// A line of feedback under the work area.
@@ -252,6 +253,10 @@ impl SimpleCutApp {
 
     pub fn player(&self) -> &Player {
         &self.player
+    }
+
+    pub fn player_mut(&mut self) -> &mut Player {
+        &mut self.player
     }
 
     pub fn source(&self) -> Source {
@@ -397,7 +402,8 @@ impl SimpleCutApp {
             | Action::GoToSentence(..)
             | Action::PlaySentence(..)
             | Action::ApplyRetakes
-            | Action::CloseReview => self.perform_retake(action),
+            | Action::CloseReview
+            | Action::SetSkipUnticked(_) => self.perform_retake(action),
             Action::NewProject => self.guard_unsaved(Then::New),
             Action::OpenProject => {
                 if let Some(path) = self.dialogs.pick_project_to_open() {
@@ -756,6 +762,7 @@ impl SimpleCutApp {
         }
         self.active_export = None;
         self.player.pause();
+        self.player.set_skips(Vec::new());
         self.retakes = RetakeUi::default();
         self.source = Source::Timeline;
         self.media_time = Tick::ZERO;
@@ -817,6 +824,16 @@ impl SimpleCutApp {
     /// Everything that happens between drawing frames: the clock, thumbnails, preview pictures, and background jobs.
     fn pump(&mut self, ctx: &egui::Context) {
         self.editor.session_mut().poll_persistence();
+
+        if let Some(crate::retakes::Stage::Review(r)) = &self.retakes.stage
+            && r.skip_unticked
+        {
+            let skips: Vec<(Tick, Tick)> =
+                self.review_marks().into_iter().filter(|m| m.kind == crate::retakes::MarkKind::Cut).map(|m| (m.start, m.end)).collect();
+            self.player.set_skips(skips);
+        } else if !self.player.current_skips().is_empty() {
+            self.player.set_skips(Vec::new());
+        }
 
         let state = self.player.tick(&mut self.editor);
         self.pump_retakes();

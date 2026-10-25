@@ -371,3 +371,48 @@ fn a_group_that_is_cut_moves_to_already_handled_and_undo_brings_it_back() {
     assert_eq!(h.state().review_groups().len(), n);
     assert!(h.state().review_handled().is_empty());
 }
+
+#[test]
+fn preview_skips_unticked_sentences_checkbox_toggle_remove_and_undo() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+
+    // Initial state: review is open, "Skip unticked sentences when playing" default ON
+    assert!(h.state().review_skips_unticked());
+    // Untick sentences of span_0 (keep last only)
+    h.state_mut().perform(Action::KeepLastOnly("span_0".into()));
+    h.step();
+
+    // Skips are set in player from Cut marks
+    assert!(!h.state().player().current_skips().is_empty(), "player has skips from unticked sentences");
+
+    // Toggle checkbox OFF
+    click(&mut h, "Skip unticked sentences when playing");
+    h.step();
+    assert!(!h.state().review_skips_unticked());
+    assert!(h.state().player().current_skips().is_empty(), "skips cleared when checkbox off");
+
+    // Toggle checkbox back ON
+    click(&mut h, "Skip unticked sentences when playing");
+    h.step();
+    assert!(h.state().review_skips_unticked());
+    assert!(!h.state().player().current_skips().is_empty(), "skips restored when checkbox on");
+
+    // After Remove: nothing left to skip
+    h.state_mut().perform(Action::ApplyRetakes);
+    h.step();
+    assert!(h.state().player().current_skips().is_empty(), "nothing left to skip after Remove");
+
+    // Undo brings the skips back
+    click(&mut h, "Undo");
+    h.step();
+    assert!(!h.state().player().current_skips().is_empty(), "Undo brings skips back");
+
+    // Close review clears skips
+    h.state_mut().perform(Action::CloseReview);
+    h.step();
+    assert!(h.state().player().current_skips().is_empty(), "closing review clears skips");
+}
