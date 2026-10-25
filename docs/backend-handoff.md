@@ -78,6 +78,7 @@ Request (maps to `AnalysisRequest`):
   "path": "C:/videos/take1.mp4",
   "name": "take1.mp4",
   "duration_seconds": 60.0,
+  "fingerprint": "4f1c...e9f",
   "used": [ [0.0, 18.2], [24.0, 60.0] ]
 }
 ```
@@ -145,7 +146,10 @@ Example: `docs/examples/retake-candidates.json` (14 sentences, 9 pairs, 4 ambigu
 | `pairs[].id` | string | `<a>\|<b>`, stable. `a` is the earlier sentence. |
 | `pairs[].a`, `b` | string | Sentence ids that exist in `sentences`. |
 | `pairs[].class` | `"likely"` or `"ambiguous"` | Only `ambiguous` pairs become questions, shown in video order. `likely` pairs are the model's own confident edges (not asked). |
-| `pairs[].score` | number 0..1 | The cross-encoder's score that they are the same line. Shown to the user as "the model is N% sure". |
+| `pairs[].score` | number 0..1 | The cross-encoder's score. **Not a calibrated probability, so the editor never shows it as a percentage**; it is for ordering and logs only. |
+| `pairs[].lean` | `"retake"` or `"different"`, optional | Which way the model leans. This is what the user sees ("The model leans: same line."). Anything else drops the pair with a reason. Absent: the card shows "no lean". |
+| `media.fingerprint` | string, optional | Identity of the file: SHA-256, lowercase hex, over `file size (u64, little endian) \|\| first 1 MiB \|\| last 1 MiB` (the whole file when under 2 MiB). The editor also sends it in `analyze` as `fingerprint`. If present it **must** match the project's file or the document is refused; it also picks the right file when several have the same length. The empty file hashes to `af5570f5...3dfc` (pinned in a test). |
+| `sentences[].internal_retake` | `{start, end}`, optional | Room for the intra-sentence restart detector. Ignored by the editor today (safe to send). |
 
 ### 4.2 Labels request (editor -> service, in `/v1/resolve`)
 Example: `docs/examples/retake-labels.json`.
@@ -228,8 +232,7 @@ Example: `docs/examples/retake-adjudication.json`.
    the timeline (first file only for now; it tells the user to run it again for the others).
 2. **Questions step.** Ambiguous pairs, in video order, one card each: both sentences with timecodes and
    "Play"/"Go to" (play uses the timeline). Buttons: Same line, Different lines, Skip. "Next" sends the
-   answers; unanswered ones are sent as `skipped` after a confirm line. The model score is shown as
-   "N% sure".
+   answers; unanswered ones are sent as `skipped` after a confirm line. The model's lean is shown ("leans: same line"), never a percentage.
 3. **Review step.** Groups as colour-coded cards, `likely: true` first and expanded, `likely: false` under
    "Possible retakes" (collapsed). Each sentence has a **Keep** tick; everything starts kept, so **nothing
    is cut until the user un-ticks**. Footer: "Remove N sentences", one undo step. Helpers: Keep last only,

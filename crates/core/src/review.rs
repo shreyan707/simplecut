@@ -50,6 +50,10 @@ pub struct DocPair {
     pub b: String,
     pub class: PairClass,
     pub score: f64,
+    /// The model's leaning ("retake" or "different"). Scores are not calibrated probabilities, so
+    /// this is what the user is shown, never a percentage.
+    #[serde(default)]
+    pub lean: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,6 +78,9 @@ pub struct DocMedia {
     #[serde(default)]
     pub path: String,
     pub duration_seconds: f64,
+    /// Hash of the file (see [`fingerprint_file`]). When present it must match the project's file.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -151,6 +158,7 @@ pub struct Pair {
     pub b: String,
     pub class: PairClass,
     pub score: f32,
+    pub lean: Option<Verdict>,
 }
 
 /// The pipeline's first answer: sentences and the pairs it wants the user to look at.
@@ -363,12 +371,21 @@ pub fn validate_v2(doc: DocV2, item: ItemId, media_duration: Tick) -> Result<Che
                     Some("it names a sentence that is not usable")
                 } else if !p.score.is_finite() || !(0.0..=1.0).contains(&p.score) {
                     Some("its score is not a number from 0 to 1")
+                } else if p.lean.as_deref().is_some_and(|l| l != "retake" && l != "different") {
+                    Some("its lean is not \"retake\" or \"different\"")
                 } else {
                     None
                 };
                 match why {
                     Some(w) => rejected.push(Rejected { id: p.id, reason: w.into() }),
-                    None => pairs.push(Pair { id: p.id, a: p.a, b: p.b, class: p.class, score: p.score as f32 }),
+                    None => {
+                        let lean = match p.lean.as_deref() {
+                            Some("retake") => Some(Verdict::Retake),
+                            Some("different") => Some(Verdict::Different),
+                            _ => None,
+                        };
+                        pairs.push(Pair { id: p.id, a: p.a, b: p.b, class: p.class, score: p.score as f32, lean });
+                    }
                 }
             }
             Ok(Checked::Candidates(Candidates { item, job: doc.job, generator: doc.generator, sentences, pairs, rejected }))
@@ -542,16 +559,61 @@ pub fn groups_to_json(job: &str, media_path: &str, duration_seconds: f64, groups
     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
 }
 
+/// The identity of a media file: SHA-256, lowercase hex, over the file size (u64, little endian), the
+/// first 1 MiB and the last 1 MiB (the whole file when it is smaller than 2 MiB). Cheap on any disk.
+/// The retake service must compute the same value.
+pub fn fingerprint_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    const PART: u64 = 1 << 20;
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    let mut buf = Vec::new();
+    if size <= 2 * PART {
+        file.read_to_end(&mut buf)?;
+        hasher.update(&buf);
+    } else {
+        buf.resize(PART as usize, 0);
+        file.read_exact(&mut buf)?;
+        hasher.update(&buf);
+        file.seek(SeekFrom::Start(size - PART))?;
+        file.read_exact(&mut buf)?;
+        hasher.update(&buf);
+    }
+    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 impl crate::editor::Editor {
     /// Read and check a version 2 document for the media file `item` of this project.
     pub fn read_review(&self, json: &str, item: ItemId) -> Result<Checked> {
         let entry = self.media_entry(item).ok_or(EditorError::NoSuchMedia)?;
-        validate_v2(parse_v2(json)?, item, entry.duration)
+        let doc = parse_v2(json)?;
+        if let (Some(want), Some(have)) = (doc.media.fingerprint.as_deref(), self.fingerprint_of(item))
+            && !want.trim().eq_ignore_ascii_case(&have)
+        {
+            return Err(EditorError::Invalid("That analysis was made for a different file (its fingerprint does not match this one).".into()));
+        }
+        validate_v2(doc, item, entry.duration)
+    }
+
+    /// The fingerprint of the project's file `item`; None when it has no path or cannot be read.
+    pub fn fingerprint_of(&self, item: ItemId) -> Option<String> {
+        let path = self.media_entry(item)?.path?;
+        fingerprint_file(std::path::Path::new(&path)).ok()
     }
 
     /// Which file of this project a version 2 document is for (by length, then by file name).
     pub fn find_media_for_review(&self, json: &str) -> Result<ItemId> {
         let doc = parse_v2(json)?;
+        // a fingerprint is a far stronger identity than the length: the file that matches it wins
+        if let Some(want) = doc.media.fingerprint.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            let hit = self.media().into_iter().find(|m| self.fingerprint_of(m.id).is_some_and(|f| f.eq_ignore_ascii_case(want)));
+            return hit
+                .map(|m| m.id)
+                .ok_or_else(|| EditorError::Invalid("None of the files in this project matches that analysis (its fingerprint is for another file).".into()));
+        }
         self.find_media_by(&doc.media.path, doc.media.duration_seconds)
     }
 }

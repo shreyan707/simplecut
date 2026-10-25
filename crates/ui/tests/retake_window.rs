@@ -116,6 +116,8 @@ fn the_steps_go_questions_then_groups_and_nothing_is_cut_until_the_user_chooses(
     assert_eq!(h.state().question_summary(), Some((4, 0, 0, 0)));
     h.get_by_label("Same line");
     h.get_by_label("Different lines");
+    h.get_by_label("The model leans: same line.");
+    assert!(h.query_by_label_contains("% sure").is_none(), "scores are not probabilities, so no percentage is shown");
 
     // answering with the real buttons moves to the next card
     click(&mut h, "Same line");

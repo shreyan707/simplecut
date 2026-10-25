@@ -33,6 +33,8 @@ pub struct AnalysisRequest {
     pub path: String,
     /// The file's length.
     pub duration: Tick,
+    /// Hash of the file (see `review::fingerprint_file`), when it could be read.
+    pub fingerprint: Option<String>,
     /// The parts of the file that are on the timeline, in file time (merged, sorted). A service may
     /// skip the rest.
     pub used: Vec<(Tick, Tick)>,
@@ -117,7 +119,8 @@ impl Editor {
                         return Err(EditorError::FileMissing(m.offline_reason.unwrap_or(m.name)));
                     }
                     let Some(path) = m.path else { continue };
-                    requests.push(AnalysisRequest { item: clip.item, name: m.name, path, duration: m.duration, used: vec![used] });
+                    let fingerprint = crate::review::fingerprint_file(std::path::Path::new(&path)).ok();
+                    requests.push(AnalysisRequest { item: clip.item, name: m.name, path, duration: m.duration, fingerprint, used: vec![used] });
                 }
             }
         }
@@ -227,12 +230,12 @@ impl FakeService {
         let pairs: Vec<_> = PAIRS
             .iter()
             .map(|(a, b, likely, score)| {
-                serde_json::json!({"id": format!("{a}|{b}"), "a": a, "b": b, "class": if *likely { "likely" } else { "ambiguous" }, "score": score})
+                serde_json::json!({"id": format!("{a}|{b}"), "a": a, "b": b, "class": if *likely { "likely" } else { "ambiguous" }, "score": score, "lean": if *score >= 0.5 { "retake" } else { "different" }})
             })
             .collect();
         serde_json::json!({
             "schema": "simplecut.retakes/2", "stage": "candidates", "job": Self::job_id(request.item),
-            "media": {"path": request.path, "duration_seconds": claimed},
+            "media": {"path": request.path, "duration_seconds": claimed, "fingerprint": request.fingerprint},
             "generator": {"name": "fake", "version": "0"},
             "sentences": sentences, "pairs": pairs
         })

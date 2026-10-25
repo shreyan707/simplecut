@@ -409,3 +409,18 @@ Decisions already made (do not re-decide):
 - Clip trim and move on the timeline still work; seek slider does not restart audio every frame.
 - No new unwrap/expect/panic in product code; no test weakened.
 - Report honestly in the final message what was NOT verified (for example anything that needs ears).
+
+
+## 17. Schema additions (DONE by the reviewer) and what is left: /v1/refine
+
+Done and committed: `pairs[].lean` (replaces the "N% sure" wording: scores are not probabilities), `media.fingerprint`
+(SHA-256 of size + first and last MiB, checked on read and used to find the file; the recipe is pinned by a test and
+described in docs/backend-handoff.md), and `sentences[].internal_retake` (accepted and ignored, tested).
+
+Left for later (assign only when asked): `POST /v1/refine` with `capabilities.refine`. The backend returns exact removal
+ranges (file time) for the removed sentences using audio and word data; modes `sentences` | `anchored` | `retake_only`.
+Rules the editor must enforce: ranges finite, ordered, non-overlapping, inside the file, at least MIN_CUT_SECS, each range
+inside its sentences' spans widened by 1 s; a sentence whose span the user edited by hand is never refined; any invalid
+range falls back to the sentence span and is reported. Remove becomes a short job (Refining..., Cancel); the skip preview and
+the timeline highlight must use the same ranges (cache per tick state and mode, sentence spans until ready); a three-way mode
+selector in the Review footer, default `sentences`. Without the capability nothing changes.

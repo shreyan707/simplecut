@@ -127,3 +127,9 @@ The "Save groups..." button exports the current review groups (including all use
 }
 ```
 This document can be loaded back into SimpleCut at any time with Ctrl+Shift+R ("Open analysis...").
+
+## Additions (optional fields)
+
+- `pairs[].lean`: `"retake"` or `"different"`. Shown instead of a percentage (scores are not probabilities).
+- `media.fingerprint`: SHA-256 hex of `file size (u64 LE) || first 1 MiB || last 1 MiB`; must match the project file when present.
+- `sentences[].internal_retake`: `{start, end}`, ignored for now.

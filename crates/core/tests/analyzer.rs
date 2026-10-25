@@ -308,3 +308,100 @@ fn cuts_in_several_files_are_one_undo_step() {
     assert!((s_of(e.sequence().unwrap().duration) - 20.0).abs() < 0.05);
     assert_eq!(e.apply_cut_sets(&[(items[0], vec![])], CutScope::MainTracks).unwrap_err(), EditorError::NothingSelected);
 }
+
+#[test]
+fn pairs_carry_a_lean_and_no_percentage_is_needed() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    let (_, c) = analyse(&e, items[0], &FakeService::default());
+    assert!(c.pairs.iter().all(|p| p.lean.is_some()), "the stand-in service says which way each pair leans");
+    let q = c.ambiguous();
+    assert_eq!(q.iter().find(|p| p.id == "17:0|18:0").unwrap().lean, Some(Verdict::Retake), "0.52 leans towards a retake");
+
+    // a document without lean still loads, one with a bad lean loses only that pair
+    let text = serde_json::json!({
+        "schema": "simplecut.retakes/2", "stage": "candidates", "job": "j",
+        "media": {"path": "x/a.mp4", "duration_seconds": 10.0},
+        "sentences": [
+            {"id": "a", "start": 1.0, "end": 2.0, "text": "one", "internal_retake": {"start": 1.2, "end": 1.5}},
+            {"id": "b", "start": 3.0, "end": 4.0, "text": "two"}],
+        "pairs": [
+            {"id": "a|b", "a": "a", "b": "b", "class": "ambiguous", "score": 0.5},
+            {"id": "b|a", "a": "b", "b": "a", "class": "ambiguous", "score": 0.5, "lean": "maybe"}]
+    })
+    .to_string();
+    let Checked::Candidates(c) = e.read_review(&text, items[0]).unwrap() else { panic!("not candidates") };
+    assert_eq!(c.sentences.len(), 2, "an internal_retake field on a sentence is ignored");
+    assert_eq!(c.pairs.len(), 1);
+    assert_eq!(c.pairs[0].lean, None);
+    assert!(c.rejected.iter().any(|r| r.id == "b|a" && r.reason.contains("lean")), "{:?}", c.rejected);
+}
+
+#[test]
+fn the_fingerprint_decides_which_file_an_analysis_is_for() {
+    if !have("ffmpeg") || !have("ffprobe") {
+        eprintln!("SKIPPED: ffmpeg / ffprobe are not installed");
+        return;
+    }
+    let dir = scratch("fingerprint-project");
+    let mut e = Editor::new();
+    e.new_project("T").unwrap();
+    let a = e.import(&[make_clip(&dir, "a.mp4", 10, true)]).unwrap().imported[0];
+    let b = e.import(&[make_clip(&dir, "b.mp4", 12, true)]).unwrap().imported[0];
+    e.place(a, Lane::Main, PlaceAt::End).unwrap();
+    e.place(b, Lane::Main, PlaceAt::End).unwrap();
+    e.select(&[]).unwrap();
+
+    let (text, _) = analyse(&e, b, &FakeService::default());
+    let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(doc["media"]["fingerprint"], serde_json::Value::String(e.fingerprint_of(b).unwrap()), "the stand-in service echoes the file's fingerprint");
+    assert_eq!(e.find_media_for_review(&text).unwrap(), b);
+
+    // the fingerprint wins over a length that points at the other file
+    doc["media"]["duration_seconds"] = 10.0.into();
+    assert_eq!(e.find_media_for_review(&doc.to_string()).unwrap(), b, "length says a, fingerprint says b");
+    doc["media"]["fingerprint"] = serde_json::Value::Null;
+    assert_eq!(e.find_media_for_review(&doc.to_string()).unwrap(), a, "without a fingerprint the length decides, as before");
+
+    // the right file accepts the document, the other one refuses it, a made-up fingerprint matches nothing
+    let mut doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(e.read_review(&doc.to_string(), b).is_ok());
+    let wrong = e.read_review(&doc.to_string(), a).unwrap_err();
+    assert!(wrong.to_string().contains("different") || wrong.to_string().contains("None"), "{wrong}");
+    doc["media"]["fingerprint"] = "00".repeat(32).into();
+    assert!(e.read_review(&doc.to_string(), b).unwrap_err().to_string().contains("different file"));
+    assert!(matches!(e.find_media_for_review(&doc.to_string()), Err(EditorError::Invalid(m)) if m.contains("fingerprint")));
+}
+
+#[test]
+fn the_fingerprint_recipe_is_size_plus_first_and_last_mebibyte() {
+    let dir = scratch("fingerprint");
+    let write = |name: &str, data: &[u8]| {
+        let p = dir.join(name);
+        std::fs::write(&p, data).unwrap();
+        p
+    };
+    let fp = |p: &std::path::Path| review::fingerprint_file(p).unwrap();
+
+    // small file: all of it counts
+    let small = write("small.bin", b"hello");
+    let small2 = write("small2.bin", b"hellp");
+    assert_eq!(fp(&small).len(), 64);
+    assert_ne!(fp(&small), fp(&small2));
+    assert_eq!(fp(&small), fp(&write("small_copy.bin", b"hello")), "same bytes, same fingerprint");
+
+    // big file: the first and last MiB and the size count, the middle does not
+    let mut big = vec![7u8; 3 << 20];
+    let base = fp(&write("big.bin", &big));
+    big[(3 << 20) / 2] = 9;
+    assert_eq!(fp(&write("big_mid.bin", &big)), base, "the middle is not read");
+    big[10] = 9;
+    assert_ne!(fp(&write("big_head.bin", &big)), base);
+    big[10] = 7;
+    big[(3 << 20) - 1] = 9;
+    assert_ne!(fp(&write("big_tail.bin", &big)), base);
+    assert_ne!(fp(&write("big_longer.bin", &vec![7u8; (3 << 20) + 1])), base, "the size counts");
+
+    // a known value pins the recipe the backend must follow: sha256(8 bytes LE size || bytes)
+    assert_eq!(fp(&write("empty.bin", b"")), "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc");
+    assert!(review::fingerprint_file(&dir.join("nope.bin")).is_err(), "an unreadable file is an error, not a panic");
+}

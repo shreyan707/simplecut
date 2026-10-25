@@ -1005,7 +1005,7 @@ fn append_labels(path: &Path, q: &Questions) -> std::io::Result<()> {
                 .find(|s| s.id == id)
                 .map(|s| serde_json::json!({"id": s.id, "text": s.text, "start": secs(s.start), "end": secs(s.end)}))
         };
-        let line = serde_json::json!({"time": now, "job": q.candidates.job, "pair": pair, "label": verdict, "source": "user", "a": side(&p.a), "b": side(&p.b), "score": p.score});
+        let line = serde_json::json!({"time": now, "job": q.candidates.job, "pair": pair, "label": verdict, "source": "user", "a": side(&p.a), "b": side(&p.b), "score": p.score, "lean": p.lean});
         writeln!(file, "{line}")?;
     }
     Ok(())
@@ -1084,7 +1084,7 @@ struct QuestionView {
     answered: usize,
     skipped: usize,
     pair_id: String,
-    score: f32,
+    lean: Option<Verdict>,
     a: Sentence,
     b: Sentence,
     verdict: Option<Verdict>,
@@ -1104,7 +1104,7 @@ fn question_view(app: &SimpleCutApp) -> Option<QuestionView> {
         index: q.index,
         answered: q.answers.len(),
         skipped: q.skipped.len(),
-        score: pair.score,
+        lean: pair.lean,
         a: find(&pair.a)?,
         b: find(&pair.b)?,
         verdict: q.answers.get(&pair_id).copied(),
@@ -1153,7 +1153,11 @@ fn questions_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
     ui.add_space(4.0);
     sentence_block(app, ui, v.item, &v.b, fps, "Later");
     ui.add_space(2.0);
-    ui.label(RichText::new(format!("The model is {:.0}% sure.", v.score * 100.0)).color(t.text_dim).small());
+    match v.lean {
+        Some(Verdict::Retake) => ui.label(RichText::new("The model leans: same line.").color(t.text_dim).small()),
+        Some(Verdict::Different) => ui.label(RichText::new("The model leans: different lines.").color(t.text_dim).small()),
+        None => ui.label(RichText::new("The model has no lean on this one.").color(t.text_dim).small()),
+    };
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         let same = ui.add(egui::Button::new("Same line").selected(v.verdict == Some(Verdict::Retake))).on_hover_text("These are attempts at the same line");
