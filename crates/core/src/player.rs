@@ -15,18 +15,19 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use filmcraft_project::ItemId;
 use filmcraft_time::Tick;
 
 use crate::editor::Editor;
 use crate::error::{EditorError, Result};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Snapshot, Target};
 
 /// What the sound card calls to get its next buffer: interleaved `f32` samples to fill, and the
 /// number of channels the card wants.
 pub type FillFn = Box<dyn FnMut(&mut [f32], usize) + Send>;
 
 /// A sound card (or a stand-in for one).
-pub trait AudioOutput: Send {
+pub trait AudioOutput {
     /// Start output. `fill(buffer, channels)` is called on the audio thread with an interleaved
     /// `f32` buffer to fill. Returns the device's sample rate.
     fn start(&mut self, fill: FillFn) -> std::result::Result<u32, String>;
@@ -189,12 +190,14 @@ pub struct Player {
     feeder: Option<Feeder>,
     snapshot: Option<Snapshot>,
     restarts: u32,
+    /// Where playback is (or stopped): the sequence playhead, or the position in the media file.
+    position: Tick,
 }
 
 impl Player {
     /// A player on `output`, or on the wall clock alone when there is no sound card.
     pub fn new(output: Option<Box<dyn AudioOutput>>) -> Self {
-        Self { output, playing: false, origin: Tick::ZERO, started: None, feeder: None, snapshot: None, restarts: 0 }
+        Self { output, playing: false, origin: Tick::ZERO, started: None, feeder: None, snapshot: None, restarts: 0, position: Tick::ZERO }
     }
 
     pub fn is_playing(&self) -> bool {
@@ -214,6 +217,36 @@ impl Player {
     /// Whether the sound card is driving the clock (false: the wall clock is).
     pub fn has_audio_clock(&self) -> bool {
         self.feeder.is_some()
+    }
+
+    /// Where playback is: the sequence playhead, or the position in the media file being previewed.
+    pub fn position(&self) -> Tick {
+        self.position
+    }
+
+    /// What is being played (or was last played).
+    pub fn target(&self) -> Option<Target> {
+        self.snapshot.as_ref().map(Snapshot::target)
+    }
+
+    /// The snapshot playback is running on.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// Preview one imported file from `from` (from its start when `from` is at or past its end).
+    /// Moves no playhead: the edit is untouched.
+    pub fn play_media(&mut self, editor: &Editor, item: ItemId, from: Tick) -> Result<()> {
+        let snapshot = Snapshot::of_media(editor, item).ok_or(EditorError::NoSuchMedia)?;
+        let end = snapshot.duration();
+        if end <= Tick::ZERO {
+            return Err(EditorError::NotAvailable("That file has nothing to play.".into()));
+        }
+        let from = if from < Tick::ZERO || from >= end { Tick::ZERO } else { from };
+        self.halt();
+        self.begin(snapshot, from);
+        self.playing = true;
+        Ok(())
     }
 
     /// Start playing from the playhead (from the start when the playhead is at the end).
@@ -248,10 +281,29 @@ impl Player {
         }
     }
 
-    /// Move the playhead; playback continues from there when it was playing.
+    /// Move the position in a media file; playback of that file continues from there when it was
+    /// playing it. Anything else that was playing is paused.
+    pub fn seek_media(&mut self, editor: &Editor, item: ItemId, to: Tick) {
+        let duration = Snapshot::of_media(editor, item).map(|s| s.duration()).unwrap_or_default();
+        let to = Tick(to.0.clamp(0, duration.0.max(0)));
+        self.position = to;
+        if self.playing && self.target() == Some(Target::Media(item)) {
+            if let Some(snapshot) = Snapshot::of_media(editor, item) {
+                self.halt();
+                self.begin(snapshot, to);
+            }
+        } else {
+            self.pause();
+        }
+    }
+
+    /// Move the playhead; playback continues from there when it was playing the sequence.
     pub fn seek(&mut self, editor: &mut Editor, to: Tick) {
         editor.set_playhead(to);
-        if self.playing {
+        self.position = editor.playhead();
+        if self.playing && !matches!(self.target(), Some(Target::Sequence(_))) {
+            self.pause();
+        } else if self.playing {
             let at = editor.playhead();
             if let Some(snapshot) = Snapshot::of(editor) {
                 self.halt();
@@ -281,11 +333,19 @@ impl Player {
         };
         let end = snapshot.duration();
         let now = self.clock();
+        let media = matches!(snapshot.target(), Target::Media(_));
         if now >= end {
             self.halt();
             self.playing = false;
-            editor.set_playhead(end);
+            self.position = end;
+            if !media {
+                editor.set_playhead(end);
+            }
             return PlayState::Ended;
+        }
+        self.position = now;
+        if media {
+            return PlayState::Playing;
         }
         editor.set_playhead(now);
         if editor.session().revision != snapshot.revision
@@ -308,6 +368,7 @@ impl Player {
 
     fn begin(&mut self, snapshot: Snapshot, from: Tick) {
         self.origin = from;
+        self.position = from;
         self.started = Some(Instant::now());
         self.feeder = self.start_feeder(&snapshot, from);
         self.snapshot = Some(snapshot);

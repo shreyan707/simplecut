@@ -7,80 +7,10 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{have, make_clip, make_music, scratch};
-use simplecut_core::{AudioOutput, Editor, EditorError, Lane, PlaceAt, PlayState, Player, PreviewRenderer, Snapshot, Tick};
-
-type Fill = simplecut_core::FillFn;
-
-/// A sound card the test drives: `pump` is the card asking for samples.
-#[derive(Clone)]
-struct Card {
-    rate: u32,
-    broken: bool,
-    fill: Arc<Mutex<Option<Fill>>>,
-}
-
-impl Card {
-    fn new(rate: u32) -> Self {
-        Card { rate, broken: false, fill: Arc::default() }
-    }
-
-    fn broken() -> Self {
-        Card { rate: 48_000, broken: true, fill: Arc::default() }
-    }
-
-    /// The card asks for `frames` stereo frames.
-    fn pump(&self, frames: usize) -> Vec<f32> {
-        let mut buf = vec![0.0f32; frames * 2];
-        if let Some(f) = self.fill.lock().unwrap().as_mut() {
-            f(&mut buf, 2);
-        }
-        buf
-    }
-}
-
-impl AudioOutput for Card {
-    fn start(&mut self, fill: Fill) -> Result<u32, String> {
-        if self.broken {
-            return Err("no such device".into());
-        }
-        *self.fill.lock().unwrap() = Some(fill);
-        Ok(self.rate)
-    }
-
-    fn stop(&mut self) {
-        *self.fill.lock().unwrap() = None;
-    }
-}
-
-/// Keep asking the card for sound until `total` frames have been delivered; returns the real
-/// (not underrun) samples.
-fn pump_until(card: &Card, player: &Player, total: u64) -> Vec<f32> {
-    let mut heard = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while player.delivered_frames() < total {
-        assert!(Instant::now() < deadline, "the mixer never caught up: {} of {total}", player.delivered_frames());
-        let before = player.delivered_frames();
-        let buf = card.pump(480);
-        let got = (player.delivered_frames() - before) as usize;
-        heard.extend_from_slice(&buf[..got * 2]);
-        if got == 0 {
-            std::thread::sleep(Duration::from_millis(3));
-        }
-    }
-    heard
-}
-
-fn peak(x: &[f32]) -> f32 {
-    x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
-}
-
-fn rms(x: &[f32]) -> f32 {
-    if x.is_empty() { 0.0 } else { (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt() }
-}
+use common::{Card, have, make_clip, make_music, peak, pump_until, rms, scratch};
+use simplecut_core::{Editor, EditorError, Lane, PlaceAt, PlayState, Player, PreviewRenderer, Snapshot, Tick};
 
 fn secs(s: f64) -> Tick {
     Tick::from_seconds_f64(s)
