@@ -12,6 +12,7 @@ use simplecut_core::{ClipId, ClipView, Edge, SequenceView, Tick, TrackId, TrackK
 
 use crate::app::{Action, SimpleCutApp};
 use crate::format;
+use crate::retakes::MarkKind;
 use crate::theme;
 use crate::tl_math::{self, Axis, ClipGeom, Hit};
 
@@ -447,18 +448,30 @@ fn interact(app: &mut SimpleCutApp, ui: &egui::Ui, resp: &egui::Response, seq: &
     }
 }
 
-/// Where the retake suggestions are: shaded over the picture and its sound.
+/// Where the retake groups are: a band over each group's span, filled where a sentence will be
+/// cut, outlined where it is kept.
 fn paint_review(app: &SimpleCutApp, painter: &egui::Painter, axis: &Axis, lanes: &[Rect]) {
-    let ranges = app.review_ranges();
-    if ranges.is_empty() {
+    let marks = app.review_marks();
+    if marks.is_empty() {
         return;
     }
     let (Some(top), Some(bottom)) = (lanes.first(), lanes.get(1)) else { return };
-    for (start, end, approved, color_idx) in ranges {
-        let color = theme::GROUP_COLORS[color_idx % theme::GROUP_COLORS.len()];
-        let r = Rect::from_min_max(pos2(axis.x_of(start), top.top()), pos2(axis.x_of(end).max(axis.x_of(start) + 2.0), bottom.bottom()));
-        painter.rect_filled(r, CornerRadius::same(3), color.gamma_multiply(if approved { 0.45 } else { 0.18 }));
-        painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(if approved { 2.0 } else { 1.0 }, color), StrokeKind::Inside);
+    for m in marks {
+        let color = theme::GROUP_COLORS[m.color % theme::GROUP_COLORS.len()];
+        let r = Rect::from_min_max(pos2(axis.x_of(m.start), top.top()), pos2(axis.x_of(m.end).max(axis.x_of(m.start) + 2.0), bottom.bottom()));
+        let radius = CornerRadius::same(3);
+        match m.kind {
+            MarkKind::Band { likely } => {
+                painter.rect_filled(r, radius, color.gamma_multiply(if likely { 0.22 } else { 0.1 }));
+            }
+            MarkKind::Cut => {
+                painter.rect_filled(r, radius, color.gamma_multiply(0.55));
+                painter.rect_stroke(r, radius, Stroke::new(2.0, color), StrokeKind::Inside);
+            }
+            MarkKind::Kept => {
+                painter.rect_stroke(r, radius, Stroke::new(1.5, color), StrokeKind::Inside);
+            }
+        }
     }
 }
 

@@ -292,3 +292,13 @@ Tests to add: core `groups()` (ordering, singleton without `group`, label number
 5. Group colours are stable, distinct and identical in the list and on the timeline; the tri-state checkbox is right for none, some and all.
 6. The real app still launches with `SIMPLECUT_FAKE_RETAKES=1`, and the manual flow works: analyse, review, apply, Undo with the panel open, analyse again.
 7. `HANDOFF.md` section 13 is accurate afterwards.
+
+## 15. Retake review v2 (DONE, replaces sections 12-14 for the UI)
+
+Contract: docs/retake-contract.md (/2). Core: crates/core/src/review.rs (types, validation), analyzer.rs
+(RetakeService trait, FakeService). UI: crates/ui/src/retakes.rs, a wizard: Analyzing, Questions (mark
+pairs, Next), Resolving, Review (Keep ticks per sentence, everything starts kept, Remove cuts the rest).
+Optional "Ask AI to choose" only when capabilities say so. Answers are logged to labels.jsonl first.
+Limits: one video file per review; /1 files are no longer read; the real HTTP client for the owner's
+Python service is not written yet (use SIMPLECUT_FAKE_RETAKES=1 to try the flow with the fake one).
+Tests: crates/ui/tests/retake_window.rs, crates/core/tests/analyzer.rs.

@@ -38,10 +38,11 @@ fn main() -> eframe::Result {
                 .map(PathBuf::from)
                 .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SimpleCut")))
                 .unwrap_or_else(|| PathBuf::from(".simplecut"));
+            app.set_label_log(Some(data_dir.join("labels.jsonl")));
             app.enable_autosave(data_dir);
-            // a stand-in detector so the whole retake flow can be tried before a real one exists
+            // a stand-in service so the whole retake flow can be tried before a real one exists
             if std::env::var_os("SIMPLECUT_FAKE_RETAKES").is_some() {
-                app.set_analyzer(Some(Box::new(simplecut_core::FakeAnalyzer::default())));
+                app.set_service(Some(Box::new(simplecut_core::FakeService { adjudicate: true, ..Default::default() })));
             }
             if let Some(path) = open {
                 app.open_project_path(path);

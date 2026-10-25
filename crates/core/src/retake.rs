@@ -20,11 +20,11 @@ pub const SCHEMA: &str = "simplecut.retakes/1";
 pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROPOSALS: usize = 100_000;
 /// How far the document's media length may differ from the file's before it is "another file".
-const DURATION_TOLERANCE_SECS: f64 = 0.5;
+pub(crate) const DURATION_TOLERANCE_SECS: f64 = 0.5;
 /// An `end` this far past the end of the file is clamped instead of rejected.
-const END_TOLERANCE_SECS: f64 = 0.05;
+pub(crate) const END_TOLERANCE_SECS: f64 = 0.05;
 /// The shortest cut worth proposing.
-const MIN_CUT_SECS: f64 = 0.01;
+pub(crate) const MIN_CUT_SECS: f64 = 0.01;
 
 // ── the document, as written by the pipeline ───────────────────────────────
 
@@ -355,9 +355,13 @@ impl Editor {
     /// Which file of this project a document is for: the one whose length matches, and if several
     /// do, the one with the same file name.
     pub fn find_media_for(&self, doc: &RetakeDocument) -> Result<ItemId> {
-        let want = doc.media.duration_seconds;
+        self.find_media_by(&doc.media.path, doc.media.duration_seconds)
+    }
+
+    /// Which file of this project a document written for `path`, `want` seconds long is for.
+    pub fn find_media_by(&self, path: &str, want: f64) -> Result<ItemId> {
         let near: Vec<_> = self.media().into_iter().filter(|m| (m.duration.0 as f64 / 254_016_000_000.0 - want).abs() <= DURATION_TOLERANCE_SECS).collect();
-        let file_name = doc.media.path.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+        let file_name = path.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
         match near.len() {
             0 => Err(EditorError::Invalid(format!("None of the files in this project matches that analysis (it is for a {want:.1} s video)."))),
             1 => Ok(near[0].id),
@@ -374,12 +378,17 @@ impl Editor {
     /// Where the part of file `item` that `p` covers is on the timeline: one range per clip of the
     /// main video track that shows it. Not rounded to frames; for drawing and for "go to".
     pub fn timeline_ranges(&self, item: ItemId, p: &CutProposal) -> Vec<(Tick, Tick)> {
+        self.timeline_ranges_of(item, p.start, p.end)
+    }
+
+    /// [`Self::timeline_ranges`] for any span of the file (a sentence, a whole group).
+    pub fn timeline_ranges_of(&self, item: ItemId, start: Tick, end: Tick) -> Vec<(Tick, Tick)> {
         let Some(q) = self.session().active_sequence() else { return Vec::new() };
         let Some(track) = q.video_tracks.first() else { return Vec::new() };
         let mut out = Vec::new();
         for clip in track.items.iter().filter(|c| c.item == item && (c.speed - 1.0).abs() <= f64::EPSILON && c.frame_hold.is_none()) {
             let (src_lo, src_hi) = (clip.source_in, clip.source_in + clip.duration);
-            let (lo, hi) = (p.start.max(src_lo), p.end.min(src_hi));
+            let (lo, hi) = (start.max(src_lo), end.min(src_hi));
             if lo < hi {
                 out.push((clip.start + (lo - src_lo), clip.start + (hi - src_lo)));
             }
@@ -394,18 +403,30 @@ impl Editor {
     /// rounding slivers from showing as suggestions). Clips with changed speed or frame hold have
     /// no mapped ranges and are therefore `Off`.
     pub fn presence(&self, item: ItemId, p: &CutProposal) -> Presence {
-        let ranges = self.timeline_ranges(item, p);
+        self.presence_of(item, p.start, p.end)
+    }
+
+    /// [`Self::presence`] for any span of the file. A span shorter than a frame needs half of itself
+    /// on the timeline (so a very short sentence is not "off" just because it is under a frame).
+    pub fn presence_of(&self, item: ItemId, start: Tick, end: Tick) -> Presence {
+        let ranges = self.timeline_ranges_of(item, start, end);
         let covered: Tick = ranges.iter().fold(Tick::ZERO, |acc, (s, e)| acc + (*e - *s));
         let frame_duration =
             self.session().active_sequence().map(|q| q.settings.frame_rate.frame_duration()).unwrap_or_else(|| Tick::from_seconds_f64(1.0 / 30.0));
-        let p_len = if p.end > p.start { Tick((p.end.0 - p.start.0) / 10) } else { Tick::ZERO };
-        let min_threshold = frame_duration.max(p_len);
-        if covered < min_threshold { Presence::Off } else { Presence::On }
+        let len = if end > start { Tick(end.0 - start.0) } else { Tick::ZERO };
+        let tenth = Tick(len.0 / 10);
+        let min_threshold = tenth.max(frame_duration.min(Tick(len.0 / 2)));
+        if covered < min_threshold || covered <= Tick::ZERO { Presence::Off } else { Presence::On }
     }
 
     /// Whether proposal `p` (for media file `item`) falls completely outside the used source range
     /// of normal clips on the main video track.
     pub fn is_outside_used(&self, item: ItemId, p: &CutProposal) -> bool {
+        self.span_outside_used(item, p.start, p.end)
+    }
+
+    /// [`Self::is_outside_used`] for any span of the file.
+    pub fn span_outside_used(&self, item: ItemId, start: Tick, end: Tick) -> bool {
         let Some(q) = self.session().active_sequence() else { return true };
         let Some(track) = q.video_tracks.first() else { return true };
         let mut min_src: Option<Tick> = None;
@@ -417,7 +438,7 @@ impl Editor {
             max_src = Some(max_src.map_or(hi, |m| m.max(hi)));
         }
         match (min_src, max_src) {
-            (Some(lo), Some(hi)) => p.end <= lo || p.start >= hi,
+            (Some(lo), Some(hi)) => end <= lo || start >= hi,
             _ => true,
         }
     }

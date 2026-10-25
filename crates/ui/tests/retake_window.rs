@@ -1,6 +1,6 @@
-//! Remove Retakes in the window: the button, the analysis, the review list, the markers on the
-//! timeline, applying the approved cuts, and loading an analysis file by hand. The detector is the
-//! stand-in one; everything around it is real.
+//! Remove Retakes in the window, step by step: the button, the questions, the groups, the keep
+//! ticks, the markers on the timeline, removing what is not kept, and the optional AI. The service
+//! is the stand-in one; everything around it is real.
 //!
 //! Skipped (with a message) when ffmpeg / ffprobe are not installed.
 
@@ -8,12 +8,10 @@
 
 mod common;
 
-use std::time::Duration;
-
-use common::harness::{Script, click, item, skip, step_until, window, window_with, with_media_and_detector};
+use common::harness::{Script, click, item, skip, step_until, window, window_with, with_media_and_service};
 use egui_kittest::kittest::{NodeT, Queryable};
-use simplecut_core::{FakeAnalyzer, Lane, Tick};
-use simplecut_ui::{Action, Source};
+use simplecut_core::{FakeService, Lane, Tick, Verdict};
+use simplecut_ui::Action;
 
 const TPS: f64 = 254_016_000_000.0;
 
@@ -23,172 +21,268 @@ fn s_of(t: Tick) -> f64 {
 
 type Win = common::harness::Window;
 
-/// The 4 s clip placed on the timeline, a detector connected, ready to look for retakes.
-fn ready(detector: FakeAnalyzer) -> Win {
-    let (mut h, _, _) = with_media_and_detector(detector);
+fn ready(service: FakeService) -> (Win, std::path::PathBuf) {
+    let (mut h, _, dir) = with_media_and_service(service);
     let video = item(&h, "talk.mp4");
     h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
     h.state_mut().perform(Action::SelectClips { clips: vec![], add: false });
     h.step();
     h.step();
-    h
+    (h, dir)
 }
 
-fn analyse(h: &mut Win) {
+fn stage(h: &mut Win, what: &'static str) {
+    step_until(h, what, |a| a.review_stage() == what);
+}
+
+/// Start, answer the way the documentation does, press Next and wait for the groups.
+fn to_review(h: &mut Win) {
     click(h, "Remove Retakes");
-    step_until(h, "the review", |a| a.review_summary().is_some());
+    stage(h, "questions");
+    let ids = h.state().question_ids();
+    assert_eq!(ids, ["9:0|11:0", "13:0|14:0", "17:0|18:0", "21:0|22:0"]);
+    h.state_mut().perform(Action::AnswerPair { pair: ids[0].clone(), verdict: Some(Verdict::Retake) });
+    h.state_mut().perform(Action::AnswerPair { pair: ids[1].clone(), verdict: None });
+    h.state_mut().perform(Action::AnswerPair { pair: ids[2].clone(), verdict: None });
+    h.state_mut().perform(Action::AnswerPair { pair: ids[3].clone(), verdict: Some(Verdict::Different) });
+    h.step();
+    h.state_mut().perform(Action::QuestionsNext);
+    h.step();
+    h.state_mut().perform(Action::QuestionsSendAnyway);
+    stage(h, "review");
 }
 
-fn video_pieces(h: &Win) -> Vec<(f64, f64)> {
+fn video_total(h: &Win) -> f64 {
     let v = h.state().editor().sequence().unwrap();
-    v.tracks[0].clips.iter().map(|c| (s_of(c.duration), s_of(c.source_in))).collect()
+    v.tracks[0].clips.iter().map(|c| s_of(c.duration)).sum()
 }
 
 #[test]
-fn the_button_appears_only_with_a_detector_and_a_video_on_the_timeline() {
+fn the_button_appears_only_with_a_service_and_a_video_on_the_timeline() {
     if skip() {
         return;
     }
     let mut plain = window(Script::default());
     plain.step();
-    assert!(plain.query_by_label("Remove Retakes").is_none(), "no detector, no button");
+    assert!(plain.query_by_label("Remove Retakes").is_none(), "no service, no button");
 
-    let mut with = window_with(Script::default(), Some(Box::new(FakeAnalyzer::default())));
+    let mut with = window_with(Script::default(), Some(Box::new(FakeService::default())));
     with.step();
     assert!(with.get_by_label("Remove Retakes").accesskit_node().is_disabled(), "nothing on the timeline to look at");
 
-    let mut h = ready(FakeAnalyzer::default());
+    let (h, _) = ready(FakeService::default());
     assert!(!h.get_by_label("Remove Retakes").accesskit_node().is_disabled());
-    h.step();
 }
 
 #[test]
-fn finding_reviewing_and_removing_retakes_is_one_undo_step() {
+fn the_steps_go_questions_then_groups_and_nothing_is_cut_until_the_user_chooses() {
     if skip() {
         return;
     }
-    let mut h = ready(FakeAnalyzer::default());
-    let before = video_pieces(&h);
+    let (mut h, dir) = ready(FakeService::default());
+    h.state_mut().set_label_log(Some(dir.join("labels.jsonl")));
     let steps = h.state().editor().session().history.undo.len();
+    let before = video_total(&h);
 
     click(&mut h, "Remove Retakes");
     assert!(h.state().is_analyzing());
     h.get_by_label("Cancel analysis");
-    step_until(&mut h, "the review", |a| a.review_summary().is_some());
+    stage(&mut h, "questions");
+    assert_eq!(h.state().question_summary(), Some((4, 0, 0, 0)));
+    h.get_by_label("Same line");
+    h.get_by_label("Different lines");
+
+    // answering with the real buttons moves to the next card
+    click(&mut h, "Same line");
+    assert_eq!(h.state().question_summary(), Some((4, 1, 0, 1)));
+    click(&mut h, "Skip");
+    assert_eq!(h.state().question_summary(), Some((4, 1, 1, 2)));
+
+    // Next with questions left over asks first
+    click(&mut h, "Next");
+    assert_eq!(h.state().review_stage(), "questions", "waiting for the user to confirm");
+    h.get_by_label("Send anyway");
+    click(&mut h, "Send anyway");
+    assert!(h.state().is_analyzing(), "the model is working");
+    stage(&mut h, "review");
+
+    // the answers were logged before they were sent
+    let log = std::fs::read_to_string(dir.join("labels.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(log.contains("\"label\":\"retake\"") && log.contains("9:0|11:0") && log.contains("\"source\":\"user\""), "{log}");
+
+    // likely groups first; nothing is cut yet, all sentences are kept
+    let groups = h.state().review_groups();
+    assert!(groups.len() >= 5, "{groups:?}");
+    assert!(groups[0].2 && groups.iter().any(|g| !g.2), "there are likely and possible groups");
+    assert_eq!(h.state().review_cut_count(), 0);
+    assert!(groups.iter().flat_map(|g| g.3.iter()).all(|id| h.state().review_kept(id) == Some(true)));
+    assert!(h.state().review_kept_rects().len() >= 10, "kept sentences are outlined");
+    assert!(h.state().review_band_rects().len() >= 5, "every group has a band");
+    assert!(h.state().review_marker_rects().is_empty(), "nothing will be cut");
+    assert_eq!(h.state().editor().session().history.undo.len(), steps);
+    h.get_by_label("Remove 0 sentences");
+
+    // untick the first take of the first group
+    let first = groups[0].3[0].clone();
+    h.state_mut().perform(Action::SetKeep { sentence: first.clone(), keep: false });
+    h.step();
+    h.step();
+    assert_eq!(h.state().review_kept(&first), Some(false));
+    assert_eq!(h.state().review_origin(&first), Some("user"));
+    assert_eq!(h.state().review_cut_count(), 1);
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+    assert_eq!(h.state().review_marker_colors(), [groups[0].1]);
+    h.get_by_label("Remove 1 sentence");
+
+    click(&mut h, "Remove 1 sentence");
+    assert!(video_total(&h) < before - 0.02, "{} vs {before}", video_total(&h));
+    assert_eq!(h.state().editor().session().history.undo.len(), steps + 1, "one undo step");
+    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Removed")), "{:?}", h.state().banner());
+
+    click(&mut h, "Undo");
+    assert!((video_total(&h) - before).abs() < 0.05);
+    assert_eq!(h.state().review_stage(), "review");
+    assert_eq!(h.state().review_groups().len(), groups.len(), "undo brings the group back");
+}
+
+#[test]
+fn at_least_one_sentence_of_a_group_stays_and_the_helpers_work() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+    let groups = h.state().review_groups();
+    let ids = groups[0].3.clone();
+    assert_eq!(ids.len(), 3);
+
+    // keep last only
+    let gid = "span_0".to_string();
+    h.state_mut().perform(Action::KeepLastOnly(gid.clone()));
+    h.step();
+    assert_eq!(h.state().review_kept(&ids[0]), Some(false));
+    assert_eq!(h.state().review_kept(&ids[1]), Some(false));
+    assert_eq!(h.state().review_kept(&ids[2]), Some(true));
+    assert_eq!(h.state().review_cut_count(), 2);
+
+    // the last one cannot be unticked
+    h.state_mut().perform(Action::SetKeep { sentence: ids[2].clone(), keep: false });
+    h.step();
+    assert_eq!(h.state().review_kept(&ids[2]), Some(true));
+    assert!(h.state().banner().is_some_and(|b| b.error && b.text.contains("at least one")), "{:?}", h.state().banner());
+
+    // keep all undoes the choice
+    h.state_mut().perform(Action::KeepAllOf(gid));
+    h.step();
+    assert_eq!(h.state().review_cut_count(), 0);
+
+    // one click for every likely group
+    h.state_mut().perform(Action::KeepLastInLikely);
+    h.step();
+    let likely_cuts: usize = h.state().review_groups().iter().filter(|g| g.2).map(|g| g.3.len() - 1).sum();
+    assert_eq!(h.state().review_cut_count(), likely_cuts);
+    assert!(h.state().review_cut_count() > 0);
+    assert!(
+        h.state().review_groups().iter().filter(|g| !g.2).flat_map(|g| g.3.iter()).all(|id| h.state().review_kept(id) == Some(true)),
+        "possible groups are left alone"
+    );
+}
+
+#[test]
+fn the_questions_can_be_asked_again_and_an_answer_can_be_changed() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+    h.state_mut().perform(Action::RedoQuestions);
+    h.step();
+    assert_eq!(h.state().review_stage(), "questions");
+    assert_eq!(h.state().question_summary().map(|q| (q.0, q.1)), Some((4, 2)), "the answers are still there");
+    h.state_mut().perform(Action::AnswerPair { pair: "17:0|18:0".into(), verdict: Some(Verdict::Retake) });
+    h.state_mut().perform(Action::QuestionsNext);
+    h.state_mut().perform(Action::QuestionsSendAnyway);
+    stage(&mut h, "review");
+    assert!(h.state().review_groups().iter().any(|g| g.3 == ["17:0", "18:0"] && g.2), "the changed answer made it likely");
+}
+
+#[test]
+fn the_ai_button_exists_only_when_the_service_offers_it_and_only_fills_in_ticks() {
+    if skip() {
+        return;
+    }
+    let (mut none, _) = ready(FakeService { adjudicate: false, ..Default::default() });
+    to_review(&mut none);
+    assert!(none.query_by_label("Ask AI to choose").is_none());
+    assert!(!none.state().ai_available());
+
+    let (mut h, _) = ready(FakeService { adjudicate: true, ..Default::default() });
+    to_review(&mut h);
+    let before = video_total(&h);
+    let steps = h.state().editor().session().history.undo.len();
+    click(&mut h, "Ask AI to choose");
+    h.get_by_label("Continue");
+    assert!(!h.state().is_analyzing(), "nothing is sent before the user agrees");
+    click(&mut h, "Continue");
+    step_until(&mut h, "the AI", |a| !a.is_analyzing() && a.banner().is_some_and(|b| b.text.contains("AI chose")));
+    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Nothing is cut")), "{:?}", h.state().banner());
+    let tagged: Vec<String> = h.state().review_groups().iter().flat_map(|g| g.3.clone()).filter(|id| h.state().review_origin(id) == Some("ai")).collect();
+    assert!(!tagged.is_empty(), "the AI's ticks are tagged");
+    assert!((video_total(&h) - before).abs() < 1e-9, "nothing was cut");
+    assert_eq!(h.state().editor().session().history.undo.len(), steps);
+
+    // the user can override
+    let group = h.state().review_groups().iter().find(|g| g.3.contains(&tagged[0])).map(|g| g.3.clone()).unwrap();
+    h.state_mut().perform(Action::SetKeep { sentence: tagged[0].clone(), keep: true });
+    h.step();
+    assert_eq!(h.state().review_origin(&tagged[0]), Some("user"));
+    assert!(group.len() >= 2);
+}
+
+#[test]
+fn a_service_with_nothing_to_ask_goes_straight_to_the_groups() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService { skip_questions: true, ..Default::default() });
+    click(&mut h, "Remove Retakes");
+    stage(&mut h, "review");
+    assert!(!h.state().review_groups().is_empty());
+}
+
+#[test]
+fn cancelling_failing_and_wrong_files_leave_nothing_behind() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService { steps: 50, ..Default::default() });
+    click(&mut h, "Remove Retakes");
+    click(&mut h, "Cancel analysis");
+    assert_eq!(h.state().review_stage(), "none");
     assert!(!h.state().is_analyzing());
 
-    // the sure ones are selected, the unsure one is left for the user
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    assert!(h.state().review_is_approved("fake_0:0") && h.state().review_is_approved("fake_0:1") && h.state().review_is_approved("fake_2:0"));
-    assert!(!h.state().review_is_approved("fake_1:0"), "a 'review' suggestion is never pre-selected");
-    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Found 4") && b.text.contains("3 selected")));
-    h.get_by_label("Remove 3 retakes");
-
-    // markers on the timeline sit on the video lane
-    let lane = h.state().timeline_lane(0).unwrap();
-    let markers = h.state().review_marker_rects();
-    assert_eq!(markers.len(), 4);
-    assert!(markers.iter().all(|m| m.top() >= lane.top() - 1.0 && m.bottom() <= lane.bottom() + 1.0 && m.width() > 1.0));
-
-    click(&mut h, "Remove 3 retakes");
-    let after = video_pieces(&h);
-    // the file's 0.4-0.6 s, 0.72-0.88 s and 2.8-2.88 s are gone
-    assert_eq!(after.len(), 4, "{after:?}");
-    for (got, want) in after.iter().map(|p| p.1).zip([0.0, 0.6, 0.88, 2.88]) {
-        assert!((got - want).abs() < 0.05, "{after:?}");
-    }
-    let total: f64 = after.iter().map(|p| p.0).sum();
-    assert!((total - (4.0 - 0.2 - 0.16 - 0.08)).abs() < 0.08, "{total}");
-    assert!(h.state().banner().is_some_and(|b| !b.error && b.text.contains("Removed 3 retakes")), "{:?}", h.state().banner());
-    assert_eq!(h.state().editor().session().history.undo.len(), steps + 1, "one undo step");
-    assert_eq!(h.state().review_summary(), Some((1, 0)), "the one left for review is still listed");
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-
-    // undo puts everything back
-    click(&mut h, "Undo");
-    assert_eq!(video_pieces(&h).len(), before.len());
-    assert!((video_pieces(&h).iter().map(|p| p.0).sum::<f64>() - 4.0).abs() < 0.05);
-}
-
-#[test]
-fn suggestions_can_be_toggled_and_selected_in_bulk() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    click(&mut h, "Select suggestion fake_1:0");
-    assert_eq!(h.state().review_summary(), Some((4, 4)));
-    click(&mut h, "Select suggestion fake_1:0");
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    click(&mut h, "Select none");
-    assert_eq!(h.state().review_summary(), Some((4, 0)));
-    assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled(), "nothing selected, nothing to remove");
-    click(&mut h, "Select sure ones");
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    let clips = h.state().editor().sequence().unwrap().clip_count();
-    assert_eq!(clips, 2, "reviewing cuts nothing");
-}
-
-#[test]
-fn go_to_moves_the_playhead_to_the_suggestion() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    click(&mut h, "Go to fake_2:0");
-    h.step();
-    assert!((s_of(h.state().editor().playhead()) - 2.8).abs() < 0.1, "{:?}", h.state().editor().playhead());
-    assert_eq!(h.state().source(), Source::Timeline);
-}
-
-#[test]
-fn closing_the_review_cuts_nothing() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    click(&mut h, "Close");
-    assert_eq!(h.state().review_summary(), None);
-    assert!(h.state().review_marker_rects().is_empty());
-    assert_eq!(video_pieces(&h).len(), 1);
-    assert_eq!(h.state().editor().sequence().unwrap().clip_count(), 2, "the picture and its sound, untouched");
-}
-
-#[test]
-fn an_analysis_can_be_cancelled_and_nothing_is_left_behind() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer { steps: 200, step_delay: Duration::from_millis(30), ..Default::default() });
-    click(&mut h, "Remove Retakes");
-    assert!(h.state().is_analyzing());
-    assert!(h.get_by_label("Remove Retakes").accesskit_node().is_disabled(), "one analysis at a time");
-    click(&mut h, "Cancel analysis");
-    step_until(&mut h, "the cancel", |a| !a.is_analyzing());
-    assert_eq!(h.state().review_summary(), None);
-    assert_eq!(h.state().banner().map(|b| b.text.as_str()), Some("Analysis cancelled."));
-}
-
-#[test]
-fn a_detector_that_fails_or_answers_for_another_file_is_reported() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer { fail_with: Some("the speech model is not installed".into()), ..Default::default() });
+    let (mut h, _) = ready(FakeService { fail_analyze: Some("model not found".into()), ..Default::default() });
     click(&mut h, "Remove Retakes");
     step_until(&mut h, "the failure", |a| a.banner().is_some_and(|b| b.error));
-    let b = h.state().banner().unwrap().clone();
-    assert!(b.text.contains("could not finish") && b.text.contains("speech model is not installed"), "{b:?}");
-    assert_eq!(h.state().review_summary(), None);
+    assert!(h.state().banner().unwrap().text.contains("model not found"));
+    assert_eq!(h.state().review_stage(), "none");
 
-    let mut h = ready(FakeAnalyzer { wrong_length: true, ..Default::default() });
+    let (mut h, _) = ready(FakeService { wrong_length: true, ..Default::default() });
     click(&mut h, "Remove Retakes");
     step_until(&mut h, "the refusal", |a| a.banner().is_some_and(|b| b.error));
-    assert!(h.state().banner().unwrap().text.contains("different file"));
-    assert_eq!(h.state().review_summary(), None);
+    assert_eq!(h.state().review_stage(), "none");
+
+    // a failing model keeps the answers
+    let (mut h, _) = ready(FakeService { fail_resolve: Some("out of memory".into()), ..Default::default() });
+    click(&mut h, "Remove Retakes");
+    stage(&mut h, "questions");
+    h.state_mut().perform(Action::AnswerPair { pair: "9:0|11:0".into(), verdict: Some(Verdict::Retake) });
+    h.state_mut().perform(Action::QuestionsNext);
+    h.state_mut().perform(Action::QuestionsSendAnyway);
+    step_until(&mut h, "the failure", |a| a.banner().is_some_and(|b| b.error && b.text.contains("out of memory")));
+    stage(&mut h, "questions");
+    assert_eq!(h.state().question_summary().map(|q| q.1), Some(1), "the answer is kept");
 }
 
 #[test]
@@ -201,29 +295,35 @@ fn an_analysis_file_made_by_hand_can_be_loaded() {
     h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
     h.step();
 
-    let good = dir.join("talk.retakes.json");
+    let good = dir.join("talk.groups.json");
     let json = serde_json::json!({
-        "schema": "simplecut.retakes/1",
+        "schema": "simplecut.retakes/2",
+        "stage": "groups",
+        "job": "j_1",
         "media": { "path": "D:/elsewhere/TALK.mp4", "duration_seconds": 4.0 },
-        "proposals": [
-            { "id": "h:0", "start": 1.0, "end": 1.5, "confidence": 0.9, "reason": "stumbled" },
-            { "id": "h:1", "start": 3.0, "end": 2.0, "confidence": 0.9 }
+        "groups": [
+            { "id": "g0", "start": 0.5, "end": 2.0, "likely": true, "sentences": [
+                { "id": "a:0", "start": 0.5, "end": 1.0, "text": "Hello there" },
+                { "id": "b:0", "start": 1.5, "end": 2.0, "text": "Hello there everyone" } ] },
+            { "id": "g1", "start": 3.0, "end": 2.0, "likely": true, "sentences": [
+                { "id": "c:0", "start": 3.0, "end": 3.2, "text": "x" },
+                { "id": "d:0", "start": 3.4, "end": 3.6, "text": "y" } ] }
         ]
     });
     std::fs::write(&good, json.to_string()).unwrap();
     script.analysis.lock().unwrap().push_back(good);
     h.state_mut().perform(Action::OpenAnalysisFile);
     h.step();
-    assert_eq!(h.state().review_summary(), Some((1, 1)));
-    assert_eq!(h.state().review_ignored(), 1, "the reversed one is ignored and reported");
-    assert_eq!(h.state().review_ids(), ["h:0"]);
+    assert_eq!(h.state().review_stage(), "review");
+    assert_eq!(h.state().review_groups().len(), 1);
+    assert_eq!(h.state().review_ignored(), 1, "the reversed group is ignored and reported");
 
-    // a file that is for a different video, one that is not JSON, and one that is missing
+    // a file for a different video, one that is not JSON, and one that is missing leave the review alone
     let other = dir.join("other.json");
     std::fs::write(&other, json.to_string().replace("4.0", "99.0")).unwrap();
     h.state_mut().perform(Action::LoadAnalysis(other));
     h.step();
-    assert!(h.state().banner().unwrap().text.contains("None of the files"), "{:?}", h.state().banner());
+    assert!(h.state().banner().unwrap().error);
     let junk = dir.join("junk.json");
     std::fs::write(&junk, "not json").unwrap();
     h.state_mut().perform(Action::LoadAnalysis(junk));
@@ -232,275 +332,25 @@ fn an_analysis_file_made_by_hand_can_be_loaded() {
     h.state_mut().perform(Action::LoadAnalysis(dir.join("nope.json")));
     h.step();
     assert!(h.state().banner().unwrap().text.contains("could not be found"));
-    assert_eq!(h.state().review_summary(), Some((1, 1)), "failed loads leave the open review alone");
-}
-
-#[test]
-fn undo_and_redo_with_review_open_brings_suggestions_back() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    assert_eq!(h.state().review_marker_rects().len(), 4);
-
-    click(&mut h, "Remove 3 retakes");
-    assert_eq!(h.state().review_summary(), Some((1, 0)));
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-
-    click(&mut h, "Undo");
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    assert!(h.state().review_is_approved("fake_0:0"));
-    assert!(h.state().review_is_approved("fake_0:1"));
-    assert!(h.state().review_is_approved("fake_2:0"));
-    assert_eq!(h.state().review_marker_rects().len(), 4);
-
-    click(&mut h, "Redo");
-    assert_eq!(h.state().review_summary(), Some((1, 0)));
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-}
-
-#[test]
-fn rerun_analysis_on_cut_video_lists_cut_ones_as_already_removed_without_sliver() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    click(&mut h, "Remove 3 retakes");
-
-    click(&mut h, "Remove Retakes");
-    step_until(&mut h, "the re-analysis", |a| !a.is_analyzing());
-
-    assert_eq!(h.state().review_summary(), Some((1, 0)));
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-    assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled());
-    assert!(h.state().banner().is_some_and(|b| !b.error));
-}
-
-#[test]
-fn a_suggestion_more_than_90_percent_cut_is_off_and_has_no_marker() {
-    if skip() {
-        return;
-    }
-    let (mut h, script, dir) = common::harness::with_media();
-    let video = item(&h, "talk.mp4");
-    h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
-    h.step();
-
-    // Trim the start by 0.95 s of a 1.0 s suggestion (leaves only 5% of it on timeline)
-    let clip = h.state().editor().sequence().unwrap().tracks[0].clips[0].id;
-    h.state_mut().perform(Action::TrimClip { clip, edge: simplecut_core::Edge::Start, delta: Tick::from_seconds_f64(0.95), ripple: true });
-    h.step();
-
-    let path = dir.join("sliver.retakes.json");
-    let json = serde_json::json!({
-        "schema": "simplecut.retakes/1",
-        "media": { "path": "D:/talk.mp4", "duration_seconds": 4.0 },
-        "proposals": [
-            { "id": "s:0", "start": 0.0, "end": 1.0, "confidence": 0.9 }
-        ]
-    });
-    std::fs::write(&path, json.to_string()).unwrap();
-    script.analysis.lock().unwrap().push_back(path);
-    h.state_mut().perform(Action::OpenAnalysisFile);
-    h.step();
-
-    // Only 0.05s (5%) is on the timeline: should be Off, so review_summary is (0, 0) and 0 markers
-    assert_eq!(h.state().review_summary(), Some((0, 0)));
-    assert_eq!(h.state().review_marker_rects().len(), 0);
-}
-
-#[test]
-fn trimming_clip_moves_suggestion_to_outside_used_part_and_undo_returns_it() {
-    if skip() {
-        return;
-    }
-    let (mut h, script, dir) = common::harness::with_media();
-    let video = item(&h, "talk.mp4");
-    h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
-    h.step();
-
-    let path = dir.join("trim.retakes.json");
-    let json = serde_json::json!({
-        "schema": "simplecut.retakes/1",
-        "media": { "path": "D:/talk.mp4", "duration_seconds": 4.0 },
-        "proposals": [
-            { "id": "t:0", "start": 0.5, "end": 1.0, "confidence": 0.9 },
-            { "id": "t:1", "start": 2.5, "end": 3.0, "confidence": 0.9 }
-        ]
-    });
-    std::fs::write(&path, json.to_string()).unwrap();
-    script.analysis.lock().unwrap().push_back(path);
-    h.state_mut().perform(Action::OpenAnalysisFile);
-    h.step();
-
-    assert_eq!(h.state().review_summary(), Some((2, 2)));
-
-    // Trim the start of the clip past 1.0s (1.5s delta ripple): t:0 is outside the used part
-    let clip = h.state().editor().sequence().unwrap().tracks[0].clips[0].id;
-    h.state_mut().perform(Action::TrimClip { clip, edge: simplecut_core::Edge::Start, delta: Tick::from_seconds_f64(1.5), ripple: true });
-    h.step();
-
-    assert_eq!(h.state().review_summary(), Some((1, 1)));
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-
-    // Undo returns t:0 to On
-    click(&mut h, "Undo");
-    assert_eq!(h.state().review_summary(), Some((2, 2)));
-    assert_eq!(h.state().review_marker_rects().len(), 2);
-}
-
-#[test]
-fn counts_and_button_label_ignore_off_suggestions() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    assert_eq!(h.state().review_summary(), Some((4, 3)));
-    h.get_by_label("Remove 3 retakes");
-
-    // Remove the 3 retakes
-    click(&mut h, "Remove 3 retakes");
-    // Now 3 are Off, only 1 is On (and it was a review one, unselected)
-    assert_eq!(h.state().review_summary(), Some((1, 0)));
-    assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled());
-    assert_eq!(h.state().review_marker_rects().len(), 1);
-
-    // Select the 1 remaining suggestion
-    click(&mut h, "Select suggestion fake_1:0");
-    assert_eq!(h.state().review_summary(), Some((1, 1)));
-    assert!(!h.get_by_label("Remove 1 retake").accesskit_node().is_disabled());
-}
-
-#[test]
-fn groups_have_headers_with_labels_and_counts_and_collapsing_hides_rows() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-
-    // Test hook returns groups with (label, color, on_ids)
-    let groups = h.state().review_groups();
-    assert_eq!(groups.len(), 3);
-    assert_eq!(groups[0], ("Retake 1".into(), 0, vec!["fake_0:0".into(), "fake_0:1".into()]));
-    assert_eq!(groups[1], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
-    assert_eq!(groups[2], ("Retake 3".into(), 2, vec!["fake_2:0".into()]));
-
-    // Accessible headers and checkboxes are present
-    h.get_by_label("Group Retake 1");
-    h.get_by_label("Group Retake 2");
-    h.get_by_label("Group Retake 3");
-    h.get_by_label("Select group Retake 1");
-    h.get_by_label("Select group Retake 2");
-    h.get_by_label("Select group Retake 3");
-
-    // Member rows are visible by default
-    assert!(h.query_by_label("Select suggestion fake_0:0").is_some());
-    assert!(h.query_by_label("Select suggestion fake_0:1").is_some());
-
-    // Collapsing Retake 1 hides its member rows
-    click(&mut h, "Group Retake 1");
-    assert!(h.query_by_label("Select suggestion fake_0:0").is_none());
-    assert!(h.query_by_label("Select suggestion fake_0:1").is_none());
-    // Other group rows remain visible
-    assert!(h.query_by_label("Select suggestion fake_1:0").is_some());
-
-    // Expanding Retake 1 brings its member rows back
-    click(&mut h, "Group Retake 1");
-    assert!(h.query_by_label("Select suggestion fake_0:0").is_some());
-    assert!(h.query_by_label("Select suggestion fake_0:1").is_some());
-}
-
-#[test]
-fn group_checkbox_toggles_all_members_and_shows_in_between_state() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-
-    // Initially both members of fake_0 are approved
-    assert!(h.state().review_is_approved("fake_0:0"));
-    assert!(h.state().review_is_approved("fake_0:1"));
-    let cb = h.get_by_label("Select group Retake 1");
-    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
-
-    // Clicking group checkbox deselects all members
-    click(&mut h, "Select group Retake 1");
-    assert!(!h.state().review_is_approved("fake_0:0"));
-    assert!(!h.state().review_is_approved("fake_0:1"));
-    let cb = h.get_by_label("Select group Retake 1");
-    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::False));
-
-    // Selecting one member puts the group checkbox in indeterminate (in-between) state
-    click(&mut h, "Select suggestion fake_0:0");
-    assert!(h.state().review_is_approved("fake_0:0"));
-    assert!(!h.state().review_is_approved("fake_0:1"));
-    let cb = h.get_by_label("Select group Retake 1");
-    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::Mixed));
-
-    // Clicking the group checkbox while in in-between state approves all members
-    click(&mut h, "Select group Retake 1");
-    assert!(h.state().review_is_approved("fake_0:0"));
-    assert!(h.state().review_is_approved("fake_0:1"));
-    let cb = h.get_by_label("Select group Retake 1");
-    assert_eq!(cb.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
-}
-
-#[test]
-fn colours_of_rows_and_markers_match_per_group() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-
-    let groups = h.state().review_groups();
-    assert_eq!(groups[0].1, 0); // Retake 1 has color 0
-    assert_eq!(groups[1].1, 1); // Retake 2 has color 1
-    assert_eq!(groups[2].1, 2); // Retake 3 has color 2
-
-    // Marker colors match the group of each proposal: fake_0:0 (0), fake_0:1 (0), fake_1:0 (1), fake_2:0 (2)
-    let marker_colors = h.state().review_marker_colors();
-    assert_eq!(marker_colors, vec![0, 0, 1, 2]);
-}
-
-#[test]
-fn groups_of_off_suggestions_are_not_in_live_list_and_undo_redo_preserves_group_state() {
-    if skip() {
-        return;
-    }
-    let mut h = ready(FakeAnalyzer::default());
-    analyse(&mut h);
-    assert_eq!(h.state().review_groups().len(), 3);
-
-    // Remove the 3 sure retakes (fake_0:0, fake_0:1, fake_2:0)
-    click(&mut h, "Remove 3 retakes");
-
-    // Groups whose suggestions are all Off (fake_0 and fake_2) leave the live list
-    let groups = h.state().review_groups();
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
-    assert!(h.query_by_label("Group Retake 1").is_none());
-    assert!(h.query_by_label("Group Retake 3").is_none());
-    assert_eq!(h.state().review_marker_colors(), vec![1]);
-
-    // Undo brings all 3 groups back with their original approved state and colors
-    click(&mut h, "Undo");
-    let groups = h.state().review_groups();
-    assert_eq!(groups.len(), 3);
-    assert_eq!(groups[0], ("Retake 1".into(), 0, vec!["fake_0:0".into(), "fake_0:1".into()]));
-    assert_eq!(groups[1], ("Retake 2".into(), 1, vec!["fake_1:0".into()]));
-    assert_eq!(groups[2], ("Retake 3".into(), 2, vec!["fake_2:0".into()]));
-    assert!(h.state().review_is_approved("fake_0:0") && h.state().review_is_approved("fake_0:1") && h.state().review_is_approved("fake_2:0"));
-    assert_eq!(h.state().review_marker_colors(), vec![0, 0, 1, 2]);
-
-    // Redo again drops the Off groups
-    click(&mut h, "Redo");
     assert_eq!(h.state().review_groups().len(), 1);
-    assert_eq!(h.state().review_marker_colors(), vec![1]);
+}
+
+#[test]
+fn a_group_that_is_cut_moves_to_already_handled_and_undo_brings_it_back() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+    let n = h.state().review_groups().len();
+    h.state_mut().perform(Action::KeepLastOnly("span_0".into()));
+    h.state_mut().perform(Action::ApplyRetakes);
+    h.step();
+    h.step();
+    assert_eq!(h.state().review_groups().len(), n - 1, "only one take of that line is on the timeline now");
+    assert_eq!(h.state().review_handled().len(), 1);
+
+    click(&mut h, "Undo");
+    assert_eq!(h.state().review_groups().len(), n);
+    assert!(h.state().review_handled().is_empty());
 }

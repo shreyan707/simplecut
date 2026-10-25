@@ -1,331 +1,675 @@
-//! Remove Retakes: start an analysis, review what it found, apply the cuts you approve.
+//! Remove Retakes, step by step.
 //!
-//! The editor does not know how detection works. An [`Analyzer`] gives back a document in the
-//! retake contract, which is read and checked like a file from disk. Nothing is cut until the user
-//! approves it, and applying is one undo step.
+//! 1. **Analyzing**: the service looks at the file and returns candidates (sentences and pairs).
+//! 2. **Questions**: the user answers the pairs the pipeline was unsure about ("same line" /
+//!    "different lines"), then presses Next. The answers are saved to a local log first, then sent.
+//! 3. **Resolving**: the service's trained cross-encoder turns the answers into groups of sentences.
+//! 4. **Review**: the user chooses which sentences of each group to **keep**. Every sentence that is
+//!    not kept is cut, in one undo step. Nothing is cut until the user presses Remove, the pipeline
+//!    never says what to keep, and the optional AI button only fills in ticks the user can change.
+//!
+//! Which groups can still be acted on is read from the live timeline every frame (a group with
+//! fewer than two sentences on the timeline is "already handled"), so Undo brings groups back.
 
-use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use egui::{Color32, CornerRadius, RichText, WidgetInfo, WidgetType};
-use simplecut_core::retake::{self, Analysis, CutProposal, CutScope, Decision, MAX_DOCUMENT_BYTES, Presence};
-use simplecut_core::{AnalysisJob, AnalysisRequest, Analyzer, Editor, ItemId, JobState, Tick};
+use simplecut_core::retake::{CutProposal, CutScope, MAX_DOCUMENT_BYTES, Presence};
+use simplecut_core::review::parse_advice;
+use simplecut_core::{
+    AdjudicateRequest, AnalysisJob, Candidates, Checked, ItemId, JobState, Label, LabelsRequest, PairClass, ResolveRequest, ReviewGroup, Sentence, Tick,
+    Verdict,
+};
 
 use crate::app::{Action, SimpleCutApp, Source};
 use crate::{format, theme};
 
-/// Proposals the detector is this sure of (and recommends removing) start out approved.
-pub const AUTO_APPROVE: f32 = 0.8;
+/// Who set a sentence's keep tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    User,
+    Ai,
+}
 
 pub(crate) struct Running {
     job: Box<dyn AnalysisJob>,
-    queue: VecDeque<AnalysisRequest>,
-    current: AnalysisRequest,
-    done: Vec<Analysis>,
+    pub item: ItemId,
     pub status: String,
     pub fraction: f32,
 }
 
+impl Running {
+    fn new(job: Box<dyn AnalysisJob>, item: ItemId, status: &str) -> Self {
+        Self { job, item, status: status.into(), fraction: 0.0 }
+    }
+
+    /// Follow the job; the finished result is handed back.
+    fn poll(&mut self) -> Option<JobState> {
+        match self.job.poll() {
+            JobState::Running { fraction, status } => {
+                self.fraction = fraction;
+                self.status = status;
+                None
+            }
+            done => Some(done),
+        }
+    }
+}
+
+/// The pairs the user is asked about.
+pub(crate) struct Questions {
+    pub item: ItemId,
+    /// The candidates document as received (a service that restarted can use it again).
+    pub raw: String,
+    pub candidates: Candidates,
+    /// Ambiguous pair ids, in video order.
+    pub order: Vec<String>,
+    pub answers: BTreeMap<String, Verdict>,
+    pub skipped: BTreeSet<String>,
+    /// The card shown.
+    pub index: usize,
+    /// Next was pressed with unanswered questions: waiting for the user to confirm.
+    pub confirm: bool,
+}
+
+impl Questions {
+    fn new(item: ItemId, raw: String, candidates: Candidates) -> Self {
+        let order = candidates.ambiguous().into_iter().map(|p| p.id.clone()).collect();
+        Self { item, raw, candidates, order, answers: BTreeMap::new(), skipped: BTreeSet::new(), index: 0, confirm: false }
+    }
+
+    fn unanswered(&self) -> usize {
+        self.order.iter().filter(|id| !self.answers.contains_key(*id)).count()
+    }
+}
+
+/// The groups, and what the user keeps.
 pub(crate) struct Review {
-    pub analyses: Vec<Analysis>,
-    pub approved: HashSet<(ItemId, String)>,
-    pub seen_on: HashSet<(ItemId, String)>,
-    pub applied: HashSet<(ItemId, String)>,
+    pub item: ItemId,
+    pub job: String,
+    pub groups: Vec<ReviewGroup>,
+    /// Sentence id -> (keep, who set it). A sentence not in the map is kept: nothing is cut until
+    /// the user (or the AI, on request) chooses.
+    pub keep: HashMap<String, (bool, Origin)>,
+    /// Sentences that have been on the timeline at some point.
+    pub seen_on: HashSet<String>,
+    pub rejected: Vec<(String, String)>,
+    /// The questions this came from, so they can be asked again.
+    pub from: Option<Questions>,
+    pub advice: Option<Running>,
+    pub notes: Vec<String>,
+    /// AI reasons by group id.
+    pub reasons: HashMap<String, String>,
+    pub ai_consent_pending: bool,
 }
 
 impl Review {
-    fn new(analyses: Vec<Analysis>, editor: &Editor) -> Self {
-        let mut seen_on = HashSet::new();
-        for a in &analyses {
-            for p in &a.proposals {
-                if editor.presence(a.item, p) == Presence::On {
-                    seen_on.insert((a.item, p.id.clone()));
-                }
-            }
-        }
-        let mut r = Self { analyses, approved: HashSet::new(), seen_on, applied: HashSet::new() };
-        r.approve_sure(editor);
-        r
+    fn is_kept(&self, id: &str) -> bool {
+        self.keep.get(id).is_none_or(|(k, _)| *k)
     }
 
-    fn approve_sure(&mut self, editor: &Editor) {
-        for a in &self.analyses {
-            for p in &a.proposals {
-                if editor.presence(a.item, p) == Presence::On && p.decision == Decision::Remove && p.confidence >= AUTO_APPROVE {
-                    self.approved.insert((a.item, p.id.clone()));
-                }
-            }
-        }
+    fn origin(&self, id: &str) -> Option<Origin> {
+        self.keep.get(id).map(|(_, o)| *o)
     }
+}
 
-    fn rejected(&self) -> Vec<(String, String)> {
-        self.analyses.iter().flat_map(|a| a.rejected.iter().map(|r| (r.id.clone(), r.reason.clone()))).collect()
-    }
-
-    fn find(&self, item: ItemId, id: &str) -> Option<&CutProposal> {
-        self.analyses.iter().find(|a| a.item == item)?.proposals.iter().find(|p| p.id == id)
-    }
+// only one exists at a time
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Stage {
+    Analyzing(Running),
+    Questions(Questions),
+    Resolving { run: Running, questions: Questions },
+    Review(Review),
 }
 
 #[derive(Default)]
 pub(crate) struct RetakeUi {
-    pub running: Option<Running>,
-    pub review: Option<Review>,
+    pub stage: Option<Stage>,
+    /// The user agreed that sentences may be sent to the AI.
+    pub ai_consented: bool,
+    /// Where answers are logged before they are sent.
+    pub label_log: Option<PathBuf>,
 }
 
 impl RetakeUi {
     pub fn visible(&self) -> bool {
-        self.running.is_some() || self.review.is_some()
+        self.stage.is_some()
+    }
+
+    pub fn busy(&self) -> bool {
+        match &self.stage {
+            Some(Stage::Analyzing(_) | Stage::Resolving { .. }) => true,
+            Some(Stage::Review(r)) => r.advice.is_some(),
+            _ => false,
+        }
     }
 }
 
+/// What the timeline draws for the review.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MarkKind {
+    /// The span of a group (stronger for a likely one).
+    Band { likely: bool },
+    /// A sentence that will be cut.
+    Cut,
+    /// A sentence that stays.
+    Kept,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Mark {
+    pub start: Tick,
+    pub end: Tick,
+    pub color: usize,
+    pub kind: MarkKind,
+}
+
+/// A group's place in the list: its label.
+fn label_of(index: usize) -> String {
+    format!("Retake {}", index + 1)
+}
+
+fn colour_of(index: usize) -> Color32 {
+    theme::GROUP_COLORS[index % theme::GROUP_COLORS.len()]
+}
+
 impl SimpleCutApp {
-    /// Connect something that can find retakes. Until then the "Remove Retakes" button is hidden.
-    pub fn set_analyzer(&mut self, analyzer: Option<Box<dyn Analyzer>>) {
-        self.analyzer = analyzer;
+    /// Connect the service that finds retakes. Until then the "Remove Retakes" button is hidden.
+    pub fn set_service(&mut self, service: Option<Box<dyn simplecut_core::RetakeService>>) {
+        self.service = service;
     }
 
-    pub fn has_analyzer(&self) -> bool {
-        self.analyzer.is_some()
+    pub fn has_service(&self) -> bool {
+        self.service.is_some()
     }
 
+    /// Whether the service offers the optional AI extension.
+    pub fn ai_available(&self) -> bool {
+        self.service.as_ref().is_some_and(|s| s.capabilities().adjudicate)
+    }
+
+    /// True while a request to the service is running.
     pub fn is_analyzing(&self) -> bool {
-        self.retakes.running.is_some()
+        self.retakes.busy()
     }
 
-    /// (suggestions, approved) of the open review, counting only suggestions currently On the timeline.
-    pub fn review_summary(&self) -> Option<(usize, usize)> {
-        let r = self.retakes.review.as_ref()?;
-        let mut total = 0;
-        let mut approved = 0;
-        for a in &r.analyses {
-            for p in &a.proposals {
-                if self.editor.presence(a.item, p) == Presence::On {
-                    total += 1;
-                    if r.approved.contains(&(a.item, p.id.clone())) {
-                        approved += 1;
-                    }
-                }
-            }
+    /// Where the user's answers are logged before they are sent.
+    pub fn set_label_log(&mut self, path: Option<PathBuf>) {
+        self.retakes.label_log = path;
+    }
+
+    /// Which step the Retakes panel is on: "none", "analyzing", "questions", "resolving" or "review".
+    pub fn review_stage(&self) -> &'static str {
+        match &self.retakes.stage {
+            None => "none",
+            Some(Stage::Analyzing(_)) => "analyzing",
+            Some(Stage::Questions(_)) => "questions",
+            Some(Stage::Resolving { .. }) => "resolving",
+            Some(Stage::Review(_)) => "review",
         }
-        Some((total, approved))
     }
 
-    /// Ids of the suggestions in the open review, in order.
-    pub fn review_ids(&self) -> Vec<String> {
-        self.retakes.review.iter().flat_map(|r| r.analyses.iter().flat_map(|a| a.proposals.iter().map(|p| p.id.clone()))).collect()
-    }
-
-    pub fn review_is_approved(&self, id: &str) -> bool {
-        self.retakes.review.as_ref().is_some_and(|r| r.approved.iter().any(|(_, i)| i == id))
-    }
-
-    /// How many suggestions were ignored as unusable.
-    pub fn review_ignored(&self) -> usize {
-        self.retakes.review.as_ref().map_or(0, |r| r.rejected().len())
-    }
-
-    /// Where the suggestions are on the timeline: (start, end, approved, color_index), for drawing.
-    pub(crate) fn review_ranges(&self) -> Vec<(Tick, Tick, bool, usize)> {
-        let Some(r) = &self.retakes.review else { return Vec::new() };
-        let mut out = Vec::new();
-        let mut offset = 0;
-        for a in &r.analyses {
-            let grps = retake::groups_with_offset(a, offset);
-            offset += grps.len();
-            let mut prop_color = vec![0; a.proposals.len()];
-            for g in &grps {
-                for &idx in &g.members {
-                    prop_color[idx] = g.color;
-                }
-            }
-            for (idx, p) in a.proposals.iter().enumerate() {
-                if self.editor.presence(a.item, p) == Presence::On {
-                    let approved = r.approved.contains(&(a.item, p.id.clone()));
-                    let color = prop_color[idx];
-                    out.extend(self.editor.timeline_ranges(a.item, p).into_iter().map(|(s, e)| (s, e, approved, color)));
-                }
-            }
+    /// (questions, answered, skipped, the card shown) while the questions are open.
+    pub fn question_summary(&self) -> Option<(usize, usize, usize, usize)> {
+        match &self.retakes.stage {
+            Some(Stage::Questions(q)) => Some((q.order.len(), q.answers.len(), q.skipped.len(), q.index)),
+            _ => None,
         }
-        out
     }
 
-    /// Screen rectangles of the suggestion markers on the video lane as last drawn.
-    pub fn review_marker_rects(&self) -> Vec<egui::Rect> {
-        let Some(g) = self.tl.last.as_ref() else { return Vec::new() };
-        let Some(lane) = g.lanes.first() else { return Vec::new() };
-        self.review_ranges()
-            .into_iter()
-            .map(|(s, e, _, _)| egui::Rect::from_min_max(egui::pos2(g.axis.x_of(s), lane.top()), egui::pos2(g.axis.x_of(e), lane.bottom())))
+    /// All question pair ids, in order.
+    pub fn question_ids(&self) -> Vec<String> {
+        match &self.retakes.stage {
+            Some(Stage::Questions(q)) => q.order.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The groups that can be acted on now: (label, colour index, likely, sentence ids).
+    pub fn review_groups(&self) -> Vec<(String, usize, bool, Vec<String>)> {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return Vec::new() };
+        r.groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| self.actionable(r.item, g))
+            .map(|(i, g)| (label_of(i), i % theme::GROUP_COLORS.len(), g.likely, g.sentences.iter().map(|s| s.id.clone()).collect()))
             .collect()
     }
 
-    /// Colour indexes of the suggestion markers on the timeline in the same order as [`review_marker_rects`].
-    pub fn review_marker_colors(&self) -> Vec<usize> {
-        self.review_ranges().into_iter().map(|(_, _, _, c)| c).collect()
+    /// Ids of the groups that are already handled or outside the used part of the video.
+    pub fn review_handled(&self) -> Vec<String> {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return Vec::new() };
+        r.groups.iter().filter(|g| !self.actionable(r.item, g)).map(|g| g.id.clone()).collect()
     }
 
-    /// Groups currently visible in the live review list: (label, colour_index, [suggestion id]).
-    /// Groups with only Off suggestions are omitted.
-    pub fn review_groups(&self) -> Vec<(String, usize, Vec<String>)> {
-        let Some(r) = &self.retakes.review else { return Vec::new() };
+    /// Whether a sentence is ticked as kept (None when there is no such sentence).
+    pub fn review_kept(&self, id: &str) -> Option<bool> {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return None };
+        r.groups.iter().any(|g| g.sentences.iter().any(|s| s.id == id)).then(|| r.is_kept(id))
+    }
+
+    /// Who set a sentence's tick: "user", "ai", or None when nobody has (the default).
+    pub fn review_origin(&self, id: &str) -> Option<&'static str> {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return None };
+        r.origin(id).map(|o| if o == Origin::Ai { "ai" } else { "user" })
+    }
+
+    /// How many sentences Remove would cut now.
+    pub fn review_cut_count(&self) -> usize {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => self.cuts(r).len(),
+            _ => 0,
+        }
+    }
+
+    /// Notes about things in the last AI reply that were ignored.
+    pub fn review_notes(&self) -> Vec<String> {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => r.notes.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How many unusable entries were dropped when the document was read.
+    pub fn review_ignored(&self) -> usize {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => r.rejected.len(),
+            Some(Stage::Questions(q)) => q.candidates.rejected.len(),
+            _ => 0,
+        }
+    }
+
+    fn on(&self, item: ItemId, s: &Sentence) -> bool {
+        self.editor.presence_of(item, s.start, s.end) == Presence::On
+    }
+
+    /// A group can be acted on while at least two of its sentences are on the timeline.
+    fn actionable(&self, item: ItemId, g: &ReviewGroup) -> bool {
+        g.sentences.iter().filter(|s| self.on(item, s)).count() >= 2
+    }
+
+    /// The sentences Remove would cut: not kept, on the timeline, in a group that can be acted on.
+    fn cuts<'a>(&self, r: &'a Review) -> Vec<&'a Sentence> {
+        r.groups.iter().filter(|g| self.actionable(r.item, g)).flat_map(|g| g.sentences.iter()).filter(|s| !r.is_kept(&s.id) && self.on(r.item, s)).collect()
+    }
+
+    /// What the timeline draws for the open review.
+    pub(crate) fn review_marks(&self) -> Vec<Mark> {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return Vec::new() };
         let mut out = Vec::new();
-        let mut offset = 0;
-        for a in &r.analyses {
-            let grps = retake::groups_with_offset(a, offset);
-            offset += grps.len();
-            for g in grps {
-                let on_ids: Vec<String> =
-                    g.members.iter().map(|&idx| &a.proposals[idx]).filter(|p| self.editor.presence(a.item, p) == Presence::On).map(|p| p.id.clone()).collect();
-                if !on_ids.is_empty() {
-                    out.push((g.label, g.color, on_ids));
+        for (i, g) in r.groups.iter().enumerate() {
+            if !self.actionable(r.item, g) {
+                continue;
+            }
+            let color = i % theme::GROUP_COLORS.len();
+            for (s, e) in self.editor.timeline_ranges_of(r.item, g.start, g.end) {
+                out.push(Mark { start: s, end: e, color, kind: MarkKind::Band { likely: g.likely } });
+            }
+            for sent in g.sentences.iter().filter(|s| self.on(r.item, s)) {
+                let kind = if r.is_kept(&sent.id) { MarkKind::Kept } else { MarkKind::Cut };
+                for (s, e) in self.editor.timeline_ranges_of(r.item, sent.start, sent.end) {
+                    out.push(Mark { start: s, end: e, color, kind });
                 }
             }
         }
         out
     }
+
+    fn mark_rects(&self, want: impl Fn(&MarkKind) -> bool) -> Vec<(egui::Rect, usize, MarkKind)> {
+        let Some(g) = self.tl.last.as_ref() else { return Vec::new() };
+        let Some(lane) = g.lanes.first() else { return Vec::new() };
+        self.review_marks()
+            .into_iter()
+            .filter(|m| want(&m.kind))
+            .map(|m| (egui::Rect::from_min_max(egui::pos2(g.axis.x_of(m.start), lane.top()), egui::pos2(g.axis.x_of(m.end), lane.bottom())), m.color, m.kind))
+            .collect()
+    }
+
+    /// Screen rectangles of the sentences that will be cut, on the video lane, as last drawn.
+    pub fn review_marker_rects(&self) -> Vec<egui::Rect> {
+        self.mark_rects(|k| *k == MarkKind::Cut).into_iter().map(|(r, ..)| r).collect()
+    }
+
+    /// Colour indexes of those, in the same order.
+    pub fn review_marker_colors(&self) -> Vec<usize> {
+        self.mark_rects(|k| *k == MarkKind::Cut).into_iter().map(|(_, c, _)| c).collect()
+    }
+
+    /// Screen rectangles of kept sentences (outlined on the timeline).
+    pub fn review_kept_rects(&self) -> Vec<egui::Rect> {
+        self.mark_rects(|k| *k == MarkKind::Kept).into_iter().map(|(r, ..)| r).collect()
+    }
+
+    /// Screen rectangles of the group spans with their colour index and whether the group is likely.
+    pub fn review_band_rects(&self) -> Vec<(egui::Rect, usize, bool)> {
+        self.mark_rects(|k| matches!(k, MarkKind::Band { .. })).into_iter().map(|(r, c, k)| (r, c, matches!(k, MarkKind::Band { likely: true }))).collect()
+    }
+
+    // ── actions ────────────────────────────────────────────────────────────
 
     pub(crate) fn perform_retake(&mut self, action: Action) {
         match action {
             Action::StartRetakeAnalysis => self.start_analysis(),
-            Action::CancelAnalysis => {
-                if let Some(r) = &mut self.retakes.running {
-                    r.job.cancel();
-                }
-            }
+            Action::CancelAnalysis => self.cancel_request(),
             Action::OpenAnalysisFile => {
                 if let Some(path) = self.dialogs.pick_analysis_file() {
                     self.load_analysis(path);
                 }
             }
             Action::LoadAnalysis(path) => self.load_analysis(path),
-            Action::ToggleProposal(item, id) => {
-                if let Some(r) = &mut self.retakes.review {
-                    let key = (item, id);
-                    if !r.approved.remove(&key) {
-                        r.approved.insert(key);
-                    }
+            Action::AnswerPair { pair, verdict } => self.answer_pair(&pair, verdict),
+            Action::SetQuestion(i) => {
+                if let Some(Stage::Questions(q)) = &mut self.retakes.stage {
+                    q.index = i.min(q.order.len().saturating_sub(1));
+                    q.confirm = false;
                 }
             }
-            Action::ToggleGroup { item, ids, approve } => {
-                if let Some(r) = &mut self.retakes.review {
-                    for id in ids {
-                        if approve {
-                            r.approved.insert((item, id));
-                        } else {
-                            r.approved.remove(&(item, id));
-                        }
-                    }
+            Action::QuestionsNext => self.questions_next(false),
+            Action::QuestionsSendAnyway => self.questions_next(true),
+            Action::SetKeep { sentence, keep } => self.set_keep(&sentence, keep),
+            Action::KeepLastOnly(group) => self.keep_last(&group),
+            Action::KeepAllOf(group) => self.keep_all(&group),
+            Action::KeepLastInLikely => {
+                let ids: Vec<String> = match &self.retakes.stage {
+                    Some(Stage::Review(r)) => r.groups.iter().filter(|g| g.likely && self.actionable(r.item, g)).map(|g| g.id.clone()).collect(),
+                    _ => Vec::new(),
+                };
+                for id in ids {
+                    self.keep_last(&id);
                 }
             }
-            Action::ApproveSure => {
-                if let Some(r) = &mut self.retakes.review {
-                    r.approve_sure(&self.editor);
+            Action::AskAi => self.ask_ai(false),
+            Action::ConfirmAi => self.ask_ai(true),
+            Action::DeclineAi => {
+                if let Some(Stage::Review(r)) = &mut self.retakes.stage {
+                    r.ai_consent_pending = false;
                 }
             }
-            Action::ApproveNone => {
-                if let Some(r) = &mut self.retakes.review {
-                    for a in &r.analyses {
-                        for p in &a.proposals {
-                            if self.editor.presence(a.item, p) == Presence::On {
-                                r.approved.remove(&(a.item, p.id.clone()));
-                            }
-                        }
-                    }
+            Action::RedoQuestions => self.redo_questions(),
+            Action::GoToSentence(item, start) => {
+                self.go_to(item, start);
+            }
+            Action::PlaySentence(item, start) => {
+                if self.go_to(item, start) && !self.player.is_playing() {
+                    self.queue(Action::TogglePlay);
                 }
             }
-            Action::GoToProposal(item, id) => self.go_to_proposal(item, &id),
             Action::ApplyRetakes => self.apply_retakes(),
-            Action::CloseReview => self.retakes.review = None,
+            Action::CloseReview => self.close_review(),
             _ => {}
         }
     }
 
     fn start_analysis(&mut self) {
-        if self.retakes.running.is_some() {
+        if self.retakes.busy() || matches!(self.retakes.stage, Some(Stage::Questions(_))) {
             return;
         }
-        let Some(analyzer) = &self.analyzer else {
-            self.fail_text("No retake detector is connected.");
+        let Some(service) = &self.service else {
+            self.fail_text("No retake service is connected.");
             return;
         };
-        let mut queue: VecDeque<AnalysisRequest> = match self.editor.analysis_requests() {
-            Ok(r) => r.into(),
+        let requests = match self.editor.analysis_requests() {
+            Ok(r) => r,
             Err(e) => {
                 self.fail_text(&e.to_string());
                 return;
             }
         };
-        let Some(current) = queue.pop_front() else { return };
-        let job = analyzer.start(current.clone());
+        let Some(first) = requests.first().cloned() else { return };
+        let job = service.analyze(first.clone());
         self.player.pause();
-        self.retakes.running = Some(Running { job, queue, current, done: Vec::new(), status: "Starting…".into(), fraction: 0.0 });
+        self.retakes.stage = Some(Stage::Analyzing(Running::new(job, first.item, "Starting…")));
+        if requests.len() > 1 {
+            self.info_text(format!("The timeline uses {} video files. Looking at “{}” first; run it again for the others.", requests.len(), first.name));
+        }
     }
 
-    /// Called once per frame: follow the running analysis.
-    pub(crate) fn pump_retakes(&mut self) {
-        let Some(mut run) = self.retakes.running.take() else { return };
-        match run.job.poll() {
-            JobState::Running { fraction, status } => {
-                run.fraction = fraction;
-                run.status = status;
-                self.retakes.running = Some(run);
+    fn cancel_request(&mut self) {
+        match self.retakes.stage.take() {
+            Some(Stage::Analyzing(mut run)) => {
+                run.job.cancel();
+                self.info_text("Analysis cancelled.");
             }
-            JobState::Cancelled => self.info_text("Analysis cancelled."),
-            JobState::Failed(why) => self.fail_text(&format!("The retake detector could not finish: {why}")),
-            JobState::Done(json) => match self.editor.read_analysis(&json, run.current.item) {
-                Err(e) => self.fail_text(&e.to_string()),
-                Ok(analysis) => {
-                    run.done.push(analysis);
-                    match run.queue.pop_front() {
-                        Some(next) => {
-                            if let Some(analyzer) = &self.analyzer {
-                                run.job = analyzer.start(next.clone());
-                                run.current = next;
-                                run.fraction = 0.0;
-                                self.retakes.running = Some(run);
-                            }
-                        }
-                        None => self.finish_analysis(run.done),
-                    }
+            Some(Stage::Resolving { mut run, questions }) => {
+                run.job.cancel();
+                self.retakes.stage = Some(Stage::Questions(questions));
+                self.info_text("Cancelled. Your answers are kept.");
+            }
+            Some(Stage::Review(mut r)) => {
+                if let Some(mut a) = r.advice.take() {
+                    a.job.cancel();
+                    self.info_text("Cancelled the AI request.");
+                }
+                self.retakes.stage = Some(Stage::Review(r));
+            }
+            other => self.retakes.stage = other,
+        }
+    }
+
+    fn close_review(&mut self) {
+        match self.retakes.stage.take() {
+            Some(Stage::Analyzing(mut run)) | Some(Stage::Resolving { mut run, .. }) => run.job.cancel(),
+            Some(Stage::Review(mut r)) => {
+                if let Some(a) = &mut r.advice {
+                    a.job.cancel();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Called once per frame: follow the running request and keep the live-view bookkeeping.
+    pub(crate) fn pump_retakes(&mut self) {
+        let Some(stage) = self.retakes.stage.take() else { return };
+        self.retakes.stage = match stage {
+            Stage::Analyzing(mut run) => match run.poll() {
+                None => Some(Stage::Analyzing(run)),
+                Some(JobState::Done(text)) => self.analysis_done(run.item, &text),
+                Some(JobState::Failed(why)) => {
+                    self.fail_text(&format!("The retake service could not finish: {why}"));
+                    None
+                }
+                Some(_) => {
+                    self.info_text("Analysis cancelled.");
+                    None
                 }
             },
+            Stage::Resolving { mut run, questions } => match run.poll() {
+                None => Some(Stage::Resolving { run, questions }),
+                Some(JobState::Done(text)) => self.resolve_done(&text, questions),
+                Some(JobState::Failed(why)) => {
+                    self.fail_text(&format!("The model could not finish: {why}. Your answers are kept."));
+                    Some(Stage::Questions(questions))
+                }
+                Some(_) => Some(Stage::Questions(questions)),
+            },
+            Stage::Review(mut r) => {
+                self.review_tick(&mut r);
+                Some(Stage::Review(r))
+            }
+            other => Some(other),
+        };
+    }
+
+    fn analysis_done(&mut self, item: ItemId, text: &str) -> Option<Stage> {
+        match self.editor.read_review(text, item) {
+            Err(e) => {
+                self.fail_text(&e.to_string());
+                None
+            }
+            Ok(Checked::Candidates(c)) => Some(self.open_questions(Questions::new(item, text.to_string(), c))),
+            Ok(Checked::Groups(g)) => Some(self.open_review(g.item, g.job, g.groups, g.rejected, None)),
         }
     }
 
-    fn finish_analysis(&mut self, analyses: Vec<Analysis>) {
-        let found: usize = analyses.iter().map(|a| a.proposals.len()).sum();
-        let ignored: usize = analyses.iter().map(|a| a.rejected.len()).sum();
-        if found == 0 {
-            let extra = if ignored > 0 { format!(" ({ignored} unusable suggestions were ignored)") } else { String::new() };
-            self.info_text(format!("No retakes found.{extra}"));
-            return;
+    /// Show the questions, or, when there are none, go straight to the model.
+    fn open_questions(&mut self, q: Questions) -> Stage {
+        if !q.order.is_empty() {
+            return Stage::Questions(q);
         }
-        let prev_applied = self.retakes.review.as_ref().map(|r| r.applied.clone()).unwrap_or_default();
-        let mut already_removed = 0;
-        for a in &analyses {
-            for p in &a.proposals {
-                if self.editor.presence(a.item, p) == Presence::Off {
-                    let is_removed = prev_applied.contains(&(a.item, p.id.clone())) || !self.editor.is_outside_used(a.item, p);
-                    if is_removed {
-                        already_removed += 1;
-                    }
+        let Some(service) = &self.service else { return Stage::Questions(q) };
+        let labels = LabelsRequest { job: q.candidates.job.clone(), labels: Vec::new(), skipped: Vec::new() };
+        let job = service.resolve(ResolveRequest { item: q.item, labels, candidates: Some(q.raw.clone()) });
+        let item = q.item;
+        Stage::Resolving { run: Running::new(job, item, "Checking with the model…"), questions: q }
+    }
+
+    fn open_review(
+        &mut self,
+        item: ItemId,
+        job: String,
+        groups: Vec<ReviewGroup>,
+        rejected: Vec<simplecut_core::retake::Rejected>,
+        from: Option<Questions>,
+    ) -> Stage {
+        let found = groups.len();
+        let likely = groups.iter().filter(|g| g.likely).count();
+        let ignored = rejected.len();
+        let mut r = Review {
+            item,
+            job,
+            groups,
+            keep: HashMap::new(),
+            seen_on: HashSet::new(),
+            rejected: rejected.into_iter().map(|x| (x.id, x.reason)).collect(),
+            from,
+            advice: None,
+            notes: Vec::new(),
+            reasons: HashMap::new(),
+            ai_consent_pending: false,
+        };
+        self.review_tick(&mut r);
+        let handled = r.groups.iter().filter(|g| !self.actionable(item, g)).count();
+        let mut text = if found == 0 {
+            "No retakes found.".to_string()
+        } else {
+            format!("Found {found} group{} ({likely} likely). Choose which sentences to keep, then remove the rest.", if found == 1 { "" } else { "s" })
+        };
+        if handled > 0 {
+            text.push_str(&format!(" {handled} already handled."));
+        }
+        if ignored > 0 {
+            text.push_str(&format!(" {ignored} unusable entr{} ignored.", if ignored == 1 { "y was" } else { "ies were" }));
+        }
+        self.info_text(text);
+        Stage::Review(r)
+    }
+
+    fn review_tick(&mut self, r: &mut Review) {
+        for g in &r.groups {
+            for s in &g.sentences {
+                if self.editor.presence_of(r.item, s.start, s.end) == Presence::On {
+                    r.seen_on.insert(s.id.clone());
                 }
             }
         }
-        let mut review = Review::new(analyses, &self.editor);
-        if let Some(prev) = &self.retakes.review {
-            for key in &prev.seen_on {
-                review.seen_on.insert(key.clone());
+        let Some(run) = &mut r.advice else { return };
+        let Some(state) = run.poll() else { return };
+        r.advice = None;
+        match state {
+            JobState::Done(text) => match parse_advice(&text, &r.groups) {
+                Err(e) => self.fail_text(&e.to_string()),
+                Ok((advice, notes)) => {
+                    let n = advice.len();
+                    for a in advice {
+                        let ids: Vec<String> =
+                            r.groups.iter().find(|g| g.id == a.group).map(|g| g.sentences.iter().map(|s| s.id.clone()).collect()).unwrap_or_default();
+                        for id in ids {
+                            let keep = a.keep.contains(&id);
+                            r.keep.insert(id, (keep, Origin::Ai));
+                        }
+                        if !a.reason.trim().is_empty() {
+                            r.reasons.insert(a.group, a.reason);
+                        }
+                    }
+                    r.notes = notes;
+                    self.info_text(format!("The AI chose what to keep in {n} group{}. Nothing is cut until you press Remove.", if n == 1 { "" } else { "s" }));
+                }
+            },
+            JobState::Failed(why) => self.fail_text(&format!("The AI could not finish: {why}")),
+            _ => self.info_text("Cancelled the AI request."),
+        }
+    }
+
+    // ── questions ──────────────────────────────────────────────────────────
+
+    fn answer_pair(&mut self, pair: &str, verdict: Option<Verdict>) {
+        let Some(Stage::Questions(q)) = &mut self.retakes.stage else { return };
+        let Some(pos) = q.order.iter().position(|id| id == pair) else { return };
+        q.confirm = false;
+        match verdict {
+            Some(v) => {
+                q.answers.insert(pair.to_string(), v);
+                q.skipped.remove(pair);
             }
-            for key in &prev.applied {
-                review.applied.insert(key.clone());
+            None => {
+                q.answers.remove(pair);
+                q.skipped.insert(pair.to_string());
             }
         }
-        let approved = review.approved.len();
-        self.retakes.review = Some(review);
-        let extra = if already_removed > 0 { format!(" ({already_removed} already removed)") } else { String::new() };
-        self.info_text(format!("Found {found} possible retake{}{extra}; {approved} selected. Review them, then remove.", if found == 1 { "" } else { "s" }));
+        q.index = (pos + 1).min(q.order.len().saturating_sub(1));
+    }
+
+    fn questions_next(&mut self, confirmed: bool) {
+        let Some(Stage::Questions(q)) = &mut self.retakes.stage else { return };
+        if !confirmed && q.unanswered() > 0 {
+            q.confirm = true;
+            return;
+        }
+        let Some(Stage::Questions(mut q)) = self.retakes.stage.take() else { return };
+        q.confirm = false;
+        let labels = LabelsRequest {
+            job: q.candidates.job.clone(),
+            labels: q.answers.iter().map(|(pair, v)| Label { pair: pair.clone(), label: *v, source: "user".into() }).collect(),
+            skipped: q.order.iter().filter(|id| !q.answers.contains_key(*id)).cloned().collect(),
+        };
+        if let Some(path) = self.retakes.label_log.clone()
+            && let Err(e) = append_labels(&path, &q)
+        {
+            self.fail_text(&format!("Could not save your answers to {}: {e}. Sending them anyway.", path.display()));
+        }
+        let Some(service) = &self.service else {
+            self.retakes.stage = Some(Stage::Questions(q));
+            return;
+        };
+        let job = service.resolve(ResolveRequest { item: q.item, labels, candidates: Some(q.raw.clone()) });
+        let item = q.item;
+        self.retakes.stage = Some(Stage::Resolving { run: Running::new(job, item, "Checking with the model…"), questions: q });
+    }
+
+    fn resolve_done(&mut self, text: &str, q: Questions) -> Option<Stage> {
+        match self.editor.read_review(text, q.item) {
+            Err(e) => {
+                self.fail_text(&format!("{e} Your answers are kept."));
+                Some(Stage::Questions(q))
+            }
+            Ok(Checked::Candidates(_)) => {
+                self.fail_text("The service sent more questions instead of groups. Your answers are kept.");
+                Some(Stage::Questions(q))
+            }
+            Ok(Checked::Groups(g)) => {
+                if !g.job.is_empty() && g.job != q.candidates.job {
+                    self.fail_text("The groups are for a different analysis than your answers. Your answers are kept.");
+                    return Some(Stage::Questions(q));
+                }
+                let job = q.candidates.job.clone();
+                Some(self.open_review(g.item, job, g.groups, g.rejected, Some(q)))
+            }
+        }
+    }
+
+    fn redo_questions(&mut self) {
+        match self.retakes.stage.take() {
+            Some(Stage::Review(mut r)) => match r.from.take() {
+                Some(q) => self.retakes.stage = Some(Stage::Questions(q)),
+                None => {
+                    self.info_text("There are no questions to ask again for this analysis.");
+                    self.retakes.stage = Some(Stage::Review(r));
+                }
+            },
+            other => self.retakes.stage = other,
+        }
     }
 
     fn load_analysis(&mut self, path: PathBuf) {
@@ -336,56 +680,120 @@ impl SimpleCutApp {
             Err(e) => Err(format!("Could not read {}: {e}", path.display())),
         };
         let result = text.and_then(|t| {
-            let doc = retake::parse(&t).map_err(|e| e.to_string())?;
-            let item = self.editor.find_media_for(&doc).map_err(|e| e.to_string())?;
-            let name = self.editor.media_entry(item).map(|m| m.name).unwrap_or_default();
-            self.editor.read_analysis(&t, item).map(|a| (a, name)).map_err(|e| e.to_string())
+            let item = self.editor.find_media_for_review(&t).map_err(|e| e.to_string())?;
+            self.editor.read_review(&t, item).map(|c| (t, item, c)).map_err(|e| e.to_string())
         });
         match result {
-            Ok((analysis, name)) => {
-                self.player.pause();
-                self.finish_analysis(vec![analysis]);
-                let _ = name;
-            }
             Err(msg) => self.fail_text(&msg),
+            Ok((text, item, checked)) => {
+                self.player.pause();
+                self.close_review();
+                self.retakes.stage = Some(match checked {
+                    Checked::Candidates(c) => self.open_questions(Questions::new(item, text, c)),
+                    Checked::Groups(g) => self.open_review(g.item, g.job, g.groups, g.rejected, None),
+                });
+            }
         }
     }
 
-    fn go_to_proposal(&mut self, item: ItemId, id: &str) {
-        let Some(p) = self.retakes.review.as_ref().and_then(|r| r.find(item, id)).cloned() else { return };
-        match self.editor.timeline_ranges(item, &p).first() {
-            Some((start, _)) => self.queue(Action::SeekTimeline(*start)),
-            None => self.info_text("That part of the video is not on the timeline."),
+    // ── review ─────────────────────────────────────────────────────────────
+
+    fn set_keep(&mut self, sentence: &str, keep: bool) {
+        let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
+        if let Some(g) = r.groups.iter().find(|g| g.sentences.iter().any(|s| s.id == sentence)) {
+            // how many sentences of the group would stay kept on the timeline after this change
+            let stay = g.sentences.iter().filter(|s| self.on(r.item, s)).filter(|s| if s.id == sentence { keep } else { r.is_kept(&s.id) }).count();
+            if stay == 0 {
+                self.fail_text("Keep at least one take of each line. If this is not a retake, press “Keep all”.");
+            } else {
+                r.keep.insert(sentence.to_string(), (keep, Origin::User));
+            }
+        }
+        self.retakes.stage = Some(Stage::Review(r));
+    }
+
+    fn keep_last(&mut self, group: &str) {
+        let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
+        if let Some(g) = r.groups.iter().find(|g| g.id == group) {
+            let last = g.sentences.iter().rfind(|s| self.on(r.item, s)).map(|s| s.id.clone());
+            if let Some(last) = last {
+                let updates: Vec<(String, bool)> = g.sentences.iter().map(|s| (s.id.clone(), s.id == last || !self.on(r.item, s))).collect();
+                for (id, keep) in updates {
+                    r.keep.insert(id, (keep, Origin::User));
+                }
+            }
+        }
+        self.retakes.stage = Some(Stage::Review(r));
+    }
+
+    fn keep_all(&mut self, group: &str) {
+        let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
+        if let Some(g) = r.groups.iter().find(|g| g.id == group) {
+            for s in &g.sentences {
+                r.keep.insert(s.id.clone(), (true, Origin::User));
+            }
+        }
+        self.retakes.stage = Some(Stage::Review(r));
+    }
+
+    fn ask_ai(&mut self, consented: bool) {
+        if !self.ai_available() {
+            self.fail_text("The AI extension is not available from this service.");
+            return;
+        }
+        if consented {
+            self.retakes.ai_consented = true;
+        }
+        let consent = self.retakes.ai_consented;
+        let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
+        if r.advice.is_some() {
+            self.retakes.stage = Some(Stage::Review(r));
+            return;
+        }
+        if !consent {
+            r.ai_consent_pending = true;
+            self.retakes.stage = Some(Stage::Review(r));
+            return;
+        }
+        r.ai_consent_pending = false;
+        let live: Vec<ReviewGroup> = r.groups.iter().filter(|g| self.actionable(r.item, g)).cloned().collect();
+        let unsure: Vec<ReviewGroup> = live.iter().filter(|g| !g.likely).cloned().collect();
+        let chosen = if unsure.is_empty() { live } else { unsure };
+        if chosen.is_empty() {
+            self.info_text("There is nothing to ask the AI about.");
+            self.retakes.stage = Some(Stage::Review(r));
+            return;
+        }
+        let request = AdjudicateRequest { item: r.item, job: r.job.clone(), groups: chosen };
+        match self.service.as_ref().and_then(|s| s.adjudicate(request)) {
+            Some(job) => r.advice = Some(Running::new(job, r.item, "Asking the AI…")),
+            None => self.fail_text("The AI extension is not available from this service."),
+        }
+        self.retakes.stage = Some(Stage::Review(r));
+    }
+
+    fn go_to(&mut self, item: ItemId, start: Tick) -> bool {
+        match self.editor.timeline_ranges_of(item, start, Tick(start.0.saturating_add(1))).first() {
+            Some((at, _)) => {
+                self.queue(Action::SeekTimeline(*at));
+                true
+            }
+            None => {
+                self.info_text("That part of the video is not on the timeline.");
+                false
+            }
         }
     }
 
     fn apply_retakes(&mut self) {
-        let Some(review) = &self.retakes.review else { return };
-        let sets: Vec<(ItemId, Vec<CutProposal>)> = review
-            .analyses
-            .iter()
-            .map(|a| {
-                (
-                    a.item,
-                    a.proposals
-                        .iter()
-                        .filter(|p| self.editor.presence(a.item, p) == Presence::On && review.approved.contains(&(a.item, p.id.clone())))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        let applied_keys: Vec<(ItemId, String)> = sets.iter().flat_map(|(item, ps)| ps.iter().map(|p| (*item, p.id.clone()))).collect();
-        match self.editor.apply_cut_sets(&sets, CutScope::MainTracks) {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return };
+        let cuts: Vec<CutProposal> = self.cuts(r).into_iter().map(Sentence::as_cut).collect();
+        let item = r.item;
+        match self.editor.apply_cut_sets(&[(item, cuts)], CutScope::MainTracks) {
             Ok(report) => {
-                if let Some(r) = &mut self.retakes.review {
-                    for key in applied_keys {
-                        r.applied.insert(key);
-                    }
-                }
                 self.source = Source::Timeline;
                 let secs = report.removed.0 as f64 / 254_016_000_000.0;
-                let mut text = format!("Removed {} retake{} ({secs:.1} s). Ctrl+Z puts them back.", report.cuts, if report.cuts == 1 { "" } else { "s" });
+                let mut text = format!("Removed {} piece{} ({secs:.1} s). Ctrl+Z puts them back.", report.cuts, if report.cuts == 1 { "" } else { "s" });
                 if let Some(n) = report.notes.first() {
                     text.push(' ');
                     text.push_str(n);
@@ -397,316 +805,420 @@ impl SimpleCutApp {
     }
 }
 
-// ── the review column ──────────────────────────────────────────────────────
-
-struct GroupView {
-    item: ItemId,
-    key: String,
-    label: String,
-    color: Color32,
-    members: Vec<Row>,
-    kept: Option<String>,
-    start: Tick,
-    end: Tick,
+/// Add the user's answers to the local log, one JSON object per line, before they are sent.
+fn append_labels(path: &Path, q: &Questions) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = |t: Tick| t.0 as f64 / 254_016_000_000.0;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    for (pair, verdict) in &q.answers {
+        let Some(p) = q.candidates.pairs.iter().find(|p| &p.id == pair) else { continue };
+        let side = |id: &str| {
+            q.candidates
+                .sentences
+                .iter()
+                .find(|s| s.id == id)
+                .map(|s| serde_json::json!({"id": s.id, "text": s.text, "start": secs(s.start), "end": secs(s.end)}))
+        };
+        let line = serde_json::json!({"time": now, "job": q.candidates.job, "pair": pair, "label": verdict, "source": "user", "a": side(&p.a), "b": side(&p.b), "score": p.score});
+        writeln!(file, "{line}")?;
+    }
+    Ok(())
 }
 
-struct Row {
-    item: ItemId,
-    id: String,
-    start: Tick,
-    end: Tick,
-    confidence: f32,
-    decision: Decision,
-    reason: String,
-    removed: String,
-    kept: String,
-    approved: bool,
-    is_removed: bool,
-    file: Option<String>,
-}
-
-fn shorten(text: &str, max: usize) -> String {
-    let t = text.trim();
-    if t.chars().count() <= max { t.to_string() } else { format!("{}…", t.chars().take(max).collect::<String>().trim_end()) }
-}
+// ── the panel ──────────────────────────────────────────────────────────────
 
 pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
-    let t = theme::tokens();
+    let (title, closable) = match app.retakes.stage {
+        Some(Stage::Questions(_)) => ("Retakes · Step 1: check uncertain pairs", true),
+        Some(Stage::Analyzing(_)) => ("Retakes · looking…", false),
+        Some(Stage::Resolving { .. }) => ("Retakes · Step 1: check uncertain pairs", false),
+        Some(Stage::Review(_)) => ("Retakes · Step 2: choose what to keep", true),
+        None => return,
+    };
     ui.horizontal(|ui| {
-        ui.heading("Retakes");
-        if app.retakes.review.is_some() {
+        ui.heading(RichText::new(title).size(15.0));
+        if closable {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Close").on_hover_text("Hide this list without cutting anything").clicked() {
+                if ui.small_button("Close").on_hover_text("Close the Retakes panel without cutting anything").clicked() {
                     app.queue(Action::CloseReview);
                 }
             });
         }
     });
     ui.separator();
-
-    if let Some(run) = &app.retakes.running {
-        ui.label(RichText::new(&run.status).color(t.text));
-        ui.add(egui::ProgressBar::new(run.fraction.clamp(0.0, 1.0)).desired_width(ui.available_width()));
-        ui.add_space(6.0);
-        if ui.button("Cancel analysis").clicked() {
-            app.queue(Action::CancelAnalysis);
-        }
-        return;
-    }
-
-    if let Some(r) = &mut app.retakes.review {
-        for a in &r.analyses {
-            for p in &a.proposals {
-                if app.editor.presence(a.item, p) == Presence::On {
-                    r.seen_on.insert((a.item, p.id.clone()));
-                }
-            }
-        }
-    }
-
     let fps = app.editor.sequence().map_or(30.0, |s| s.fps);
-    let many = app.retakes.review.as_ref().is_some_and(|r| r.analyses.len() > 1);
-    let (live_groups, off_rows, ignored): (Vec<GroupView>, Vec<Row>, Vec<(String, String)>) = match &app.retakes.review {
-        Some(r) => {
-            let mut live_groups = Vec::new();
-            let mut off_rows = Vec::new();
-            let mut offset = 0;
-            for a in &r.analyses {
-                let file = many.then(|| app.editor.media_entry(a.item).map(|m| m.name)).flatten();
-                let grps = retake::groups_with_offset(a, offset);
-                offset += grps.len();
-                for g in grps {
-                    let mut group_on = Vec::new();
-                    let kept = g.members.iter().map(|&idx| &a.proposals[idx].kept_text).find(|t| !t.trim().is_empty()).cloned();
-                    for &idx in &g.members {
-                        let p = &a.proposals[idx];
-                        let on = app.editor.presence(a.item, p) == Presence::On;
-                        let is_removed = r.applied.contains(&(a.item, p.id.clone())) || !app.editor.is_outside_used(a.item, p);
-                        let row = Row {
-                            item: a.item,
-                            id: p.id.clone(),
-                            start: p.start,
-                            end: p.end,
-                            confidence: p.confidence,
-                            decision: p.decision,
-                            reason: p.reason.clone(),
-                            removed: p.removed_text.clone(),
-                            kept: p.kept_text.clone(),
-                            approved: r.approved.contains(&(a.item, p.id.clone())),
-                            is_removed,
-                            file: file.clone(),
-                        };
-                        if on {
-                            group_on.push(row);
-                        } else {
-                            off_rows.push(row);
-                        }
-                    }
-                    if !group_on.is_empty() {
-                        let start = group_on.iter().map(|m| m.start).min().unwrap_or(Tick::ZERO);
-                        let end = group_on.iter().map(|m| m.end).max().unwrap_or(Tick::ZERO);
-                        let color = theme::GROUP_COLORS[g.color % theme::GROUP_COLORS.len()];
-                        live_groups.push(GroupView { item: a.item, key: g.key, label: g.label, color, members: group_on, kept, start, end });
-                    }
-                }
-            }
-            (live_groups, off_rows, r.rejected())
+    match &app.retakes.stage {
+        Some(Stage::Analyzing(run)) => {
+            let (s, f) = (run.status.clone(), run.fraction);
+            progress(app, ui, &s, f, "Cancel analysis");
         }
-        None => return,
-    };
+        Some(Stage::Resolving { run, .. }) => {
+            let (s, f) = (run.status.clone(), run.fraction);
+            progress(app, ui, &s, f, "Cancel checking");
+        }
+        Some(Stage::Questions(_)) => questions_panel(app, ui, fps),
+        Some(Stage::Review(_)) => review_panel(app, ui, fps),
+        None => {}
+    }
+}
 
-    let total: usize = live_groups.iter().map(|g| g.members.len()).sum();
-    let approved: usize = live_groups.iter().flat_map(|g| &g.members).filter(|m| m.approved).count();
+fn progress(app: &mut SimpleCutApp, ui: &mut egui::Ui, status: &str, fraction: f32, cancel: &str) {
+    let t = theme::tokens();
+    ui.label(RichText::new(status).color(t.text));
+    ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(ui.available_width()));
+    ui.add_space(6.0);
+    if ui.button(cancel).clicked() {
+        app.queue(Action::CancelAnalysis);
+    }
+}
 
-    if total == 0 {
-        ui.label(RichText::new("Everything in this list is already removed. Ctrl+Z brings it back.").color(t.text_dim));
-    } else {
-        ui.label(RichText::new(format!("{total} possible retake{} · {approved} selected", if total == 1 { "" } else { "s" })).color(t.text_dim));
-        ui.horizontal_wrapped(|ui| {
-            if ui.small_button("Select sure ones").on_hover_text("Select what the detector is at least 80 % sure about").clicked() {
-                app.queue(Action::ApproveSure);
+struct QuestionView {
+    count: usize,
+    index: usize,
+    answered: usize,
+    skipped: usize,
+    pair_id: String,
+    score: f32,
+    a: Sentence,
+    b: Sentence,
+    verdict: Option<Verdict>,
+    was_skipped: bool,
+    item: ItemId,
+    confirm: bool,
+    unanswered: usize,
+}
+
+fn question_view(app: &SimpleCutApp) -> Option<QuestionView> {
+    let Some(Stage::Questions(q)) = &app.retakes.stage else { return None };
+    let pair_id = q.order.get(q.index)?.clone();
+    let pair = q.candidates.pairs.iter().find(|p| p.id == pair_id && p.class == PairClass::Ambiguous)?;
+    let find = |id: &str| q.candidates.sentences.iter().find(|s| s.id == id).cloned();
+    Some(QuestionView {
+        count: q.order.len(),
+        index: q.index,
+        answered: q.answers.len(),
+        skipped: q.skipped.len(),
+        score: pair.score,
+        a: find(&pair.a)?,
+        b: find(&pair.b)?,
+        verdict: q.answers.get(&pair_id).copied(),
+        was_skipped: q.skipped.contains(&pair_id),
+        pair_id,
+        item: q.item,
+        confirm: q.confirm,
+        unanswered: q.unanswered(),
+    })
+}
+
+fn sentence_block(app: &mut SimpleCutApp, ui: &mut egui::Ui, item: ItemId, s: &Sentence, fps: f64, label: &str) {
+    let t = theme::tokens();
+    egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(label).color(t.text_dim).small());
+            ui.label(RichText::new(format!("{} – {}", format::timecode(s.start, fps), format::timecode(s.end, fps))).monospace().color(t.text_dim));
+        });
+        ui.label(RichText::new(format!("“{}”", s.text)).color(t.text).size(15.0));
+        ui.horizontal(|ui| {
+            let play = ui.small_button("Play").on_hover_text("Play this sentence from the timeline");
+            play.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Play {}", s.id)));
+            if play.clicked() {
+                app.queue(Action::PlaySentence(item, s.start));
             }
-            if ui.small_button("Select none").clicked() {
-                app.queue(Action::ApproveNone);
+            let go = ui.small_button("Go to").on_hover_text("Move the playhead here");
+            go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Go to {}", s.id)));
+            if go.clicked() {
+                app.queue(Action::GoToSentence(item, s.start));
             }
         });
-    }
+    });
+}
+
+fn questions_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
+    let t = theme::tokens();
+    let Some(v) = question_view(app) else {
+        ui.label("There is nothing to ask.");
+        return;
+    };
+    ui.label(RichText::new(format!("Question {} of {} · {} answered · {} skipped", v.index + 1, v.count, v.answered, v.skipped)).color(t.text_dim));
+    ui.label(RichText::new("Are these two the same line, said again?").color(t.text).strong());
     ui.add_space(4.0);
-
-    let list_height = (ui.available_height() - 64.0).max(80.0);
-    egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
-        for group in &live_groups {
-            let id = ui.make_persistent_id(format!("retake_group_{}_{}", group.item.0, group.key));
-            let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
-
-            let count = group.members.len();
-            let on_member_ids: Vec<String> = group.members.iter().map(|m| m.id.clone()).collect();
-            let all_approved = group.members.iter().all(|m| m.approved);
-            let some_approved = group.members.iter().any(|m| m.approved);
-            let indeterminate = !all_approved && some_approved;
-            let group_label = group.label.clone();
-            let group_key = group.key.clone();
-            let group_color = group.color;
-            let item = group.item;
-
-            let mut toggle_group_action = None;
-            let mut title_clicked = false;
-
-            let mut res = state.show_header(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().circle_filled(dot_rect.center(), 4.0, group_color);
-
-                    let title_resp =
-                        ui.add(egui::Label::new(RichText::new(&group_label).strong().color(t.text)).sense(egui::Sense::click())).on_hover_text(&group_key);
-                    if title_resp.clicked() {
-                        title_clicked = true;
-                    }
-
-                    let count_text = format!("({} suggestion{})", count, if count == 1 { "" } else { "s" });
-                    ui.label(RichText::new(count_text).color(t.text_dim));
-
-                    let span_text = format!("{} – {}", format::timecode(group.start, fps), format::timecode(group.end, fps));
-                    ui.label(RichText::new(span_text).color(t.text_dim));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(20.0);
-                        let mut checked = all_approved;
-                        let cb = ui.add(egui::Checkbox::without_text(&mut checked).indeterminate(indeterminate));
-                        let acc_label = format!("Select group {group_label}");
-                        cb.widget_info(move || {
-                            if indeterminate {
-                                WidgetInfo::labeled(WidgetType::Checkbox, true, acc_label.clone())
-                            } else {
-                                WidgetInfo::selected(WidgetType::Checkbox, true, checked, acc_label.clone())
-                            }
-                        });
-                        if cb.clicked() {
-                            toggle_group_action = Some(Action::ToggleGroup { item, ids: on_member_ids.clone(), approve: !all_approved });
-                        }
-                    });
-                });
-            });
-
-            if title_clicked {
-                res.toggle();
-            }
-            if let Some(act) = toggle_group_action {
-                app.queue(act);
-            }
-
-            let (toggle_btn, _, _) = res.body(|ui| {
-                if let Some(kept) = &group.kept {
-                    ui.add_space(2.0);
-                    ui.label(RichText::new(format!("Keeps: “{}”", shorten(kept, 120))).color(t.text));
-                    ui.add_space(2.0);
-                }
-
-                for row in &group.members {
-                    let frame_resp = egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let mut checked = row.approved;
-                            let label = format!("{} – {}", format::timecode(row.start, fps), format::timecode(row.end, fps));
-                            let r = ui.checkbox(&mut checked, label);
-                            r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, true, row.approved, format!("Select suggestion {}", row.id)));
-                            if r.clicked() {
-                                app.queue(Action::ToggleProposal(row.item, row.id.clone()));
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let sure = if row.confidence >= AUTO_APPROVE {
-                                    t.accent
-                                } else if row.confidence >= 0.5 {
-                                    t.text
-                                } else {
-                                    t.text_dim
-                                };
-                                ui.label(RichText::new(format!("{:.0}%", row.confidence * 100.0)).color(sure).strong());
-                                if row.decision == Decision::Review {
-                                    ui.label(RichText::new("REVIEW").color(Color32::from_rgb(0xf0, 0xa8, 0x40)).small());
-                                }
-                            });
-                        });
-                        if let Some(file) = &row.file {
-                            ui.label(RichText::new(file).color(t.text_dim).small());
-                        }
-                        if !row.reason.is_empty() {
-                            ui.label(RichText::new(&row.reason).color(t.text_dim));
-                        }
-                        if !row.removed.is_empty() {
-                            ui.label(RichText::new(format!("Cut: “{}”", shorten(&row.removed, 120))).color(t.danger));
-                        }
-                        let go = ui.small_button("Go to").on_hover_text("Move the playhead here");
-                        go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Go to {}", row.id)));
-                        if go.clicked() {
-                            app.queue(Action::GoToProposal(row.item, row.id.clone()));
-                        }
-                    });
-
-                    let r = frame_resp.response.rect;
-                    let stripe = egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 4.0, r.bottom()));
-                    ui.painter().rect_filled(stripe, CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 }, group_color);
-
-                    ui.add_space(4.0);
-                }
-            });
-            toggle_btn.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("Group {group_label}")));
-            ui.add_space(6.0);
+    sentence_block(app, ui, v.item, &v.a, fps, "Earlier");
+    ui.add_space(4.0);
+    sentence_block(app, ui, v.item, &v.b, fps, "Later");
+    ui.add_space(2.0);
+    ui.label(RichText::new(format!("The model is {:.0}% sure.", v.score * 100.0)).color(t.text_dim).small());
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let same = ui.add(egui::Button::new("Same line").selected(v.verdict == Some(Verdict::Retake))).on_hover_text("These are attempts at the same line");
+        if same.clicked() {
+            app.queue(Action::AnswerPair { pair: v.pair_id.clone(), verdict: Some(Verdict::Retake) });
         }
+        let diff = ui.add(egui::Button::new("Different lines").selected(v.verdict == Some(Verdict::Different))).on_hover_text("These are two different lines");
+        if diff.clicked() {
+            app.queue(Action::AnswerPair { pair: v.pair_id.clone(), verdict: Some(Verdict::Different) });
+        }
+        let skip = ui.add(egui::Button::new("Skip").selected(v.was_skipped)).on_hover_text("Let the model decide");
+        if skip.clicked() {
+            app.queue(Action::AnswerPair { pair: v.pair_id.clone(), verdict: None });
+        }
+    });
+    ui.horizontal(|ui| {
+        if ui.add_enabled(v.index > 0, egui::Button::new("Previous question")).clicked() {
+            app.queue(Action::SetQuestion(v.index.saturating_sub(1)));
+        }
+        if ui.add_enabled(v.index + 1 < v.count, egui::Button::new("Next question")).clicked() {
+            app.queue(Action::SetQuestion(v.index + 1));
+        }
+    });
+    ui.add_space(8.0);
+    ui.separator();
+    if v.confirm {
+        let (is, them) = if v.unanswered == 1 { (" is", "it") } else { ("s are", "them") };
+        ui.label(RichText::new(format!("{} question{is} unanswered. The model will decide {them}.", v.unanswered)).color(t.text));
+        ui.horizontal(|ui| {
+            if ui.button("Send anyway").clicked() {
+                app.queue(Action::QuestionsSendAnyway);
+            }
+            if ui.button("Keep answering").clicked() {
+                app.queue(Action::SetQuestion(v.index));
+            }
+        });
+    } else if ui
+        .add(egui::Button::new(RichText::new("Next").strong()).min_size(egui::vec2(ui.available_width(), 30.0)))
+        .on_hover_text("Send your answers to the model and make the groups")
+        .clicked()
+    {
+        app.queue(Action::QuestionsNext);
+    }
+}
 
-        if !off_rows.is_empty() {
-            ui.add_space(4.0);
-            egui::CollapsingHeader::new(RichText::new(format!("Already removed or not on the timeline ({})", off_rows.len())).color(t.text_dim))
+struct SentenceRow {
+    sentence: Sentence,
+    kept: bool,
+    on: bool,
+    origin: Option<Origin>,
+}
+
+struct GroupView {
+    id: String,
+    label: String,
+    color_index: usize,
+    likely: bool,
+    start: Tick,
+    end: Tick,
+    rows: Vec<SentenceRow>,
+    reason: Option<String>,
+    seen_off: bool,
+}
+
+fn review_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
+    let t = theme::tokens();
+    let ai = app.ai_available();
+    let (item, groups, pending, advice_running, notes, can_redo, ignored) = {
+        let Some(Stage::Review(r)) = &app.retakes.stage else { return };
+        let groups: Vec<GroupView> = r
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| GroupView {
+                id: g.id.clone(),
+                label: label_of(i),
+                color_index: i,
+                likely: g.likely,
+                start: g.start,
+                end: g.end,
+                rows: g
+                    .sentences
+                    .iter()
+                    .map(|s| SentenceRow { sentence: s.clone(), kept: r.is_kept(&s.id), on: app.on(r.item, s), origin: r.origin(&s.id) })
+                    .collect(),
+                reason: r.reasons.get(&g.id).cloned(),
+                seen_off: g.sentences.iter().any(|s| r.seen_on.contains(&s.id) && !app.on(r.item, s)),
+            })
+            .collect();
+        (r.item, groups, r.ai_consent_pending, r.advice.as_ref().map(|a| (a.status.clone(), a.fraction)), r.notes.clone(), r.from.is_some(), r.rejected.len())
+    };
+    let live = |g: &GroupView| g.rows.iter().filter(|r| r.on).count() >= 2;
+    let cut_count: usize = groups.iter().filter(|g| live(g)).map(|g| g.rows.iter().filter(|r| r.on && !r.kept).count()).sum();
+    let group_count = groups.iter().filter(|g| live(g) && g.rows.iter().any(|r| r.on && !r.kept)).count();
+
+    ui.horizontal_wrapped(|ui| {
+        if ai
+            && ui
+                .add_enabled(advice_running.is_none(), egui::Button::new("Ask AI to choose"))
+                .on_hover_text("Ask the AI which sentences to keep. It only fills in the ticks; nothing is cut until you press Remove.")
+                .clicked()
+        {
+            app.queue(Action::AskAi);
+        }
+        if ui.small_button("Keep last in all likely groups").on_hover_text("Tick only the last sentence of every likely group").clicked() {
+            app.queue(Action::KeepLastInLikely);
+        }
+        if can_redo && ui.small_button("Redo the questions").on_hover_text("Go back and change your answers").clicked() {
+            app.queue(Action::RedoQuestions);
+        }
+    });
+    if pending {
+        egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+            ui.label("The sentences of the groups you ask about will be sent to the AI service. Continue?");
+            ui.horizontal(|ui| {
+                if ui.button("Continue").clicked() {
+                    app.queue(Action::ConfirmAi);
+                }
+                if ui.button("Not now").clicked() {
+                    app.queue(Action::DeclineAi);
+                }
+            });
+        });
+    }
+    if let Some((status, fraction)) = &advice_running {
+        ui.label(RichText::new(status).color(t.text));
+        ui.add(egui::ProgressBar::new(fraction.clamp(0.0, 1.0)).desired_width(ui.available_width()));
+        if ui.button("Cancel AI request").clicked() {
+            app.queue(Action::CancelAnalysis);
+        }
+    }
+    for n in &notes {
+        ui.label(RichText::new(n).color(t.danger).small());
+    }
+    ui.label(
+        RichText::new(format!(
+            "{cut_count} sentence{} will be removed from {group_count} group{}",
+            if cut_count == 1 { "" } else { "s" },
+            if group_count == 1 { "" } else { "s" }
+        ))
+        .color(t.text_dim),
+    );
+    ui.add_space(2.0);
+
+    let list_height = (ui.available_height() - 52.0).max(80.0);
+    egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
+        let likely: Vec<&GroupView> = groups.iter().filter(|g| live(g) && g.likely).collect();
+        let possible: Vec<&GroupView> = groups.iter().filter(|g| live(g) && !g.likely).collect();
+        let handled: Vec<&GroupView> = groups.iter().filter(|g| !live(g)).collect();
+        if likely.is_empty() && possible.is_empty() {
+            ui.label(RichText::new("Nothing to choose here. Everything is already handled; Ctrl+Z brings removed sentences back.").color(t.text_dim));
+        }
+        if !likely.is_empty() {
+            ui.label(RichText::new(format!("Likely retakes ({})", likely.len())).strong().color(t.text));
+            for g in likely {
+                group_card(app, ui, item, g, fps, true);
+            }
+        }
+        if !possible.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new(format!("Possible retakes ({})", possible.len())).strong().color(t.text))
+                .id_salt("possible-retakes")
                 .default_open(false)
                 .show(ui, |ui| {
-                    for row in &off_rows {
-                        egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                let mut checked = row.approved;
-                                let label = format!("{} – {}", format::timecode(row.start, fps), format::timecode(row.end, fps));
-                                let r = ui.add_enabled(false, egui::Checkbox::new(&mut checked, RichText::new(label).color(t.text_dim)));
-                                r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, false, row.approved, format!("Select suggestion {}", row.id)));
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    ui.label(RichText::new(format!("{:.0}%", row.confidence * 100.0)).color(t.text_dim));
-                                });
-                            });
-                            let status = if row.is_removed { "Already removed" } else { "Outside the part of the video you used" };
-                            ui.label(RichText::new(status).color(t.text_dim).small());
-                            if let Some(file) = &row.file {
-                                ui.label(RichText::new(file).color(t.text_dim).small());
-                            }
-                            if !row.reason.is_empty() {
-                                ui.label(RichText::new(&row.reason).color(t.text_dim).small());
-                            }
-                            if !row.removed.is_empty() {
-                                ui.label(RichText::new(format!("Cut: “{}”", shorten(&row.removed, 120))).color(t.text_dim).small());
-                            }
-                            if !row.kept.is_empty() {
-                                ui.label(RichText::new(format!("Keeps: “{}”", shorten(&row.kept, 120))).color(t.text_dim).small());
-                            }
-                        });
-                        ui.add_space(4.0);
+                    for g in possible {
+                        group_card(app, ui, item, g, fps, false);
                     }
                 });
         }
-
-        if !ignored.is_empty() {
-            ui.collapsing(format!("{} unusable suggestion{} ignored", ignored.len(), if ignored.len() == 1 { "" } else { "s" }), |ui| {
-                for (id, why) in &ignored {
-                    ui.label(RichText::new(format!("{id}: {why}")).color(t.text_dim).small());
-                }
-            });
+        if !handled.is_empty() {
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(RichText::new(format!("Already handled or not on the timeline ({})", handled.len())).color(t.text_dim))
+                .id_salt("handled-retakes")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for g in handled {
+                        let why = if g.seen_off { "already removed" } else { "outside the part of the video you used" };
+                        ui.label(RichText::new(format!("{} · {} sentences · {}", g.label, g.rows.len(), why)).color(t.text_dim).small());
+                    }
+                });
+        }
+        if ignored > 0 {
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("{ignored} unusable entr{} ignored.", if ignored == 1 { "y was" } else { "ies were" })).color(t.text_dim).small());
         }
     });
 
     ui.add_space(6.0);
-    let label = format!("Remove {approved} retake{}", if approved == 1 { "" } else { "s" });
+    let label = format!("Remove {cut_count} sentence{}", if cut_count == 1 { "" } else { "s" });
     if ui
-        .add_enabled(approved > 0, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(ui.available_width(), 30.0)))
-        .on_hover_text("Cut the selected ones out of the video (one undo step)")
+        .add_enabled(cut_count > 0, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(ui.available_width(), 30.0)))
+        .on_hover_text("Cut every sentence that is not ticked as kept (one undo step)")
         .clicked()
     {
         app.queue(Action::ApplyRetakes);
     }
+}
+
+fn group_card(app: &mut SimpleCutApp, ui: &mut egui::Ui, item: ItemId, g: &GroupView, fps: f64, open: bool) {
+    let t = theme::tokens();
+    let color = colour_of(g.color_index);
+    let on_rows = g.rows.iter().filter(|r| r.on).count();
+    let ai = g.rows.iter().any(|r| r.origin == Some(Origin::Ai));
+    let title = RichText::new(format!(
+        "●  {}  ·  {} sentences  ·  {} – {}{}",
+        g.label,
+        on_rows,
+        format::timecode(g.start, fps),
+        format::timecode(g.end, fps),
+        if ai { "  ·  AI" } else { "" }
+    ))
+    .color(color)
+    .strong();
+    let res = egui::CollapsingHeader::new(title).id_salt(("retake-group", &g.id)).default_open(open).show(ui, |ui| {
+        if let Some(reason) = &g.reason {
+            ui.label(RichText::new(format!("AI: {reason}")).color(t.text_dim).small());
+        }
+        for row in &g.rows {
+            let s = &row.sentence;
+            egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let mut kept = row.kept;
+                    let text = format!("{} – {}", format::timecode(s.start, fps), format::timecode(s.end, fps));
+                    let cb = ui.add_enabled(row.on, egui::Checkbox::new(&mut kept, text));
+                    cb.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, row.on, row.kept, format!("Keep {}", s.id)));
+                    if cb.clicked() {
+                        app.queue(Action::SetKeep { sentence: s.id.clone(), keep: !row.kept });
+                    }
+                    if !row.on {
+                        ui.label(RichText::new("not on the timeline").color(t.text_dim).small());
+                    } else if !row.kept {
+                        ui.label(RichText::new("will be removed").color(t.danger).small());
+                    }
+                    if row.origin == Some(Origin::Ai) {
+                        ui.label(RichText::new("AI").color(color).small());
+                    }
+                });
+                ui.label(RichText::new(format!("“{}”", s.text)).color(if row.on { t.text } else { t.text_dim }));
+                ui.horizontal(|ui| {
+                    let play = ui.small_button("Play");
+                    play.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Play {}", s.id)));
+                    if play.clicked() {
+                        app.queue(Action::PlaySentence(item, s.start));
+                    }
+                    let go = ui.small_button("Go to");
+                    go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Go to {}", s.id)));
+                    if go.clicked() {
+                        app.queue(Action::GoToSentence(item, s.start));
+                    }
+                });
+            });
+            ui.add_space(3.0);
+        }
+        ui.horizontal(|ui| {
+            let last = ui.small_button("Keep last only");
+            last.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Keep last only in {}", g.label)));
+            if last.clicked() {
+                app.queue(Action::KeepLastOnly(g.id.clone()));
+            }
+            let all = ui.small_button("Keep all");
+            all.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Keep all in {}", g.label)));
+            if all.clicked() {
+                app.queue(Action::KeepAllOf(g.id.clone()));
+            }
+        });
+    });
+    res.header_response.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("Group {}", g.label)));
+    ui.add_space(4.0);
 }

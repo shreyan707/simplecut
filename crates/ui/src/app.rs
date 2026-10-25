@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use egui::{Align2, Key, Modifiers, RichText};
 use simplecut_core::{
-    Analyzer, AudioOutput, ClipId, Edge, Editor, EditorError, ExportJob, ExportOptions, ExportState, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState,
-    Player, PreviewFrame, PreviewRenderer, Snapshot, Target, Thumbnails, Tick, TrackId, TrimMode,
+    AudioOutput, ClipId, Edge, Editor, EditorError, ExportJob, ExportOptions, ExportState, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player,
+    PreviewFrame, PreviewRenderer, Snapshot, Target, Thumbnails, Tick, TrackId, TrimMode,
 };
 
 use crate::dialogs::Dialogs;
@@ -95,19 +95,30 @@ pub enum Action {
     /// Choose an analysis file (see docs/retake-contract.md) and review it.
     OpenAnalysisFile,
     LoadAnalysis(PathBuf),
-    /// Select or deselect one suggestion.
-    ToggleProposal(ItemId, String),
-    /// Select or deselect every proposal in a group.
-    ToggleGroup {
-        item: ItemId,
-        ids: Vec<String>,
-        approve: bool,
+    /// Mark a question: Some(verdict), or None to skip it.
+    AnswerPair {
+        pair: String,
+        verdict: Option<simplecut_core::Verdict>,
     },
-    /// Select what the detector is sure about.
-    ApproveSure,
-    ApproveNone,
-    GoToProposal(ItemId, String),
-    /// Cut the selected suggestions out of the video.
+    SetQuestion(usize),
+    /// Send the answers to the model and make the groups.
+    QuestionsNext,
+    QuestionsSendAnyway,
+    /// Tick or untick a sentence as kept.
+    SetKeep {
+        sentence: String,
+        keep: bool,
+    },
+    KeepLastOnly(String),
+    KeepAllOf(String),
+    KeepLastInLikely,
+    AskAi,
+    ConfirmAi,
+    DeclineAi,
+    RedoQuestions,
+    GoToSentence(ItemId, Tick),
+    PlaySentence(ItemId, Tick),
+    /// Cut every sentence that is not kept.
     ApplyRetakes,
     CloseReview,
 }
@@ -172,7 +183,7 @@ pub struct SimpleCutApp {
     renderer: PreviewRenderer,
     thumbs: Thumbnails,
     pub(crate) dialogs: Box<dyn Dialogs>,
-    pub(crate) analyzer: Option<Box<dyn Analyzer>>,
+    pub(crate) service: Option<Box<dyn simplecut_core::RetakeService>>,
     pub(crate) retakes: RetakeUi,
 
     pub(crate) source: Source,
@@ -209,7 +220,7 @@ impl SimpleCutApp {
             renderer: PreviewRenderer::new(),
             thumbs: Thumbnails::new(),
             dialogs,
-            analyzer: None,
+            service: None,
             retakes: RetakeUi::default(),
             source: Source::Timeline,
             media_time: Tick::ZERO,
@@ -369,11 +380,20 @@ impl SimpleCutApp {
             | Action::CancelAnalysis
             | Action::OpenAnalysisFile
             | Action::LoadAnalysis(_)
-            | Action::ToggleProposal(..)
-            | Action::ToggleGroup { .. }
-            | Action::ApproveSure
-            | Action::ApproveNone
-            | Action::GoToProposal(..)
+            | Action::AnswerPair { .. }
+            | Action::SetQuestion(_)
+            | Action::QuestionsNext
+            | Action::QuestionsSendAnyway
+            | Action::SetKeep { .. }
+            | Action::KeepLastOnly(_)
+            | Action::KeepAllOf(_)
+            | Action::KeepLastInLikely
+            | Action::AskAi
+            | Action::ConfirmAi
+            | Action::DeclineAi
+            | Action::RedoQuestions
+            | Action::GoToSentence(..)
+            | Action::PlaySentence(..)
             | Action::ApplyRetakes
             | Action::CloseReview => self.perform_retake(action),
             Action::NewProject => self.guard_unsaved(Then::New),
@@ -859,8 +879,7 @@ impl SimpleCutApp {
             }
         }
 
-        let busy =
-            self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle() || self.active_export.is_some() || self.retakes.running.is_some();
+        let busy = self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle() || self.active_export.is_some() || self.retakes.busy();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(16));
         }

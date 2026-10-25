@@ -39,7 +39,7 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
             button(app, ui, "Shortcuts", "View keyboard shortcuts (F1)", Action::OpenShortcuts, true);
             ui.separator();
             button(app, ui, "Export", export_tip, Action::OpenExportDialog, can_export);
-            if app.has_analyzer() {
+            if app.has_service() {
                 let busy = app.is_analyzing();
                 let tip = if is_exporting {
                     "Wait for the export to finish."

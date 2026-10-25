@@ -1,5 +1,6 @@
-//! The detector interface (with the stand-in detector), what the editor asks a detector to look at,
-//! and the mapping from file time to the timeline used by the review list.
+//! The retake service interface with the stand-in service (candidates, then groups after the
+//! user's answers, then the optional AI advice), what the editor asks a service to look at, and the
+//! mapping from file time to the timeline used by the review.
 //!
 //! Skipped (with a message) when ffmpeg / ffprobe are not installed.
 
@@ -11,7 +12,11 @@ use std::time::{Duration, Instant};
 
 use common::{have, make_clip, scratch};
 use simplecut_core::retake::{CutProposal, CutScope, Decision};
-use simplecut_core::{AnalysisJob, Analyzer, Edge, Editor, EditorError, FakeAnalyzer, ItemId, JobState, Lane, PlaceAt, Tick, TrimMode};
+use simplecut_core::review::{self, parse_advice};
+use simplecut_core::{
+    AdjudicateRequest, AnalysisJob, Candidates, Checked, Edge, Editor, EditorError, FakeService, Groups, ItemId, JobState, Label, LabelsRequest, Lane, PlaceAt,
+    ResolveRequest, RetakeService, Tick, TrimMode, Verdict,
+};
 
 const TPS: f64 = 254_016_000_000.0;
 
@@ -39,6 +44,7 @@ fn proposal(id: &str, start: f64, end: f64) -> CutProposal {
     }
 }
 
+/// A project with 10 s clips of the given names, placed one after the other.
 fn project(names: &[&str]) -> Option<(Editor, Vec<ItemId>)> {
     if !have("ffmpeg") || !have("ffprobe") {
         eprintln!("SKIPPED: ffmpeg / ffprobe are not installed");
@@ -65,42 +71,167 @@ fn finish(job: &mut Box<dyn AnalysisJob>) -> (Vec<f32>, JobState) {
             JobState::Running { fraction, .. } => fractions.push(fraction),
             other => return (fractions, other),
         }
-        assert!(Instant::now() < deadline, "the analysis never finished");
+        assert!(Instant::now() < deadline, "the request never finished");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-#[test]
-fn the_stand_in_detector_reports_progress_and_returns_a_document_the_editor_accepts() {
-    let Some((e, items)) = project(&["a.mp4"]) else { return };
-    let request = e.analysis_requests().unwrap().remove(0);
-    assert_eq!(request.item, items[0]);
-    let mut job = FakeAnalyzer::default().start(request);
-    let (fractions, end) = finish(&mut job);
-    assert!(fractions.windows(2).all(|w| w[0] <= w[1]), "progress only goes forward: {fractions:?}");
-    let JobState::Done(json) = end else { panic!("not done: {end:?}") };
-    let a = e.read_analysis(&json, items[0]).unwrap();
-    assert_eq!(a.proposals.len(), 4);
-    assert!(a.rejected.is_empty());
-    assert_eq!(a.proposals[2].decision, Decision::Review);
+fn done(job: &mut Box<dyn AnalysisJob>) -> String {
+    match finish(job).1 {
+        JobState::Done(text) => text,
+        other => panic!("not done: {other:?}"),
+    }
+}
+
+fn analyse(e: &Editor, item: ItemId, svc: &FakeService) -> (String, Candidates) {
+    let request = e.analysis_requests().unwrap().into_iter().find(|r| r.item == item).unwrap();
+    let mut job = svc.analyze(request);
+    let text = done(&mut job);
+    let Checked::Candidates(c) = e.read_review(&text, item).unwrap() else { panic!("not candidates") };
+    (text, c)
+}
+
+fn resolve(e: &Editor, item: ItemId, svc: &FakeService, text: &str, c: &Candidates, labels: &[(&str, Verdict)], skipped: &[&str]) -> Groups {
+    let labels = LabelsRequest {
+        job: c.job.clone(),
+        labels: labels.iter().map(|(p, v)| Label { pair: (*p).into(), label: *v, source: "user".into() }).collect(),
+        skipped: skipped.iter().map(|s| (*s).into()).collect(),
+    };
+    let mut job = svc.resolve(ResolveRequest { item, labels, candidates: Some(text.into()) });
+    let Checked::Groups(g) = e.read_review(&done(&mut job), item).unwrap() else { panic!("not groups") };
+    g
+}
+
+fn ids(g: &Groups) -> Vec<(Vec<String>, bool)> {
+    g.groups.iter().map(|x| (x.sentences.iter().map(|s| s.id.clone()).collect(), x.likely)).collect()
+}
+
+fn v(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
 }
 
 #[test]
-fn an_analysis_can_be_cancelled_can_fail_and_can_be_for_the_wrong_file() {
+fn analyzing_returns_candidates_scaled_to_the_file_and_the_questions_in_video_order() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    let (_, c) = analyse(&e, items[0], &FakeService::default());
+    assert_eq!(c.sentences.len(), 14);
+    assert!(c.rejected.is_empty(), "{:?}", c.rejected);
+    assert!(s_of(c.sentences.last().unwrap().end) < 10.0, "a 10 s file gets 10 s of sentences: {:?}", c.sentences.last());
+    let asked: Vec<&str> = c.ambiguous().iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(asked, ["9:0|11:0", "13:0|14:0", "17:0|18:0", "21:0|22:0"]);
+}
+
+#[test]
+fn the_documented_answers_make_the_documented_groups() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    let svc = FakeService::default();
+    let (text, c) = analyse(&e, items[0], &svc);
+    let g = resolve(&e, items[0], &svc, &text, &c, &[("9:0|11:0", Verdict::Retake), ("21:0|22:0", Verdict::Different)], &["13:0|14:0", "17:0|18:0"]);
+    assert_eq!(
+        ids(&g),
+        vec![
+            (v(&["3:0", "4:0", "5:0"]), true),
+            (v(&["9:0", "11:0"]), true),
+            (v(&["13:0", "14:0"]), true),
+            (v(&["15:0", "16:0"]), true),
+            (v(&["17:0", "18:0"]), false),
+            (v(&["20:0", "21:0"]), true),
+        ],
+        "the user's answer joined 9:0 and 11:0, split 22:0 off, the model decided 13:0|14:0 and was unsure about 17:0|18:0"
+    );
+    assert_eq!(g.job, c.job);
+    assert!(g.groups.iter().all(|x| x.sentences.iter().all(|s| s.id != "22:0")), "a sentence with no partner is in no group");
+}
+
+#[test]
+fn other_answers_regroup_the_sentences() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    let svc = FakeService::default();
+    let (text, c) = analyse(&e, items[0], &svc);
+
+    // "different" on 9:0|11:0 leaves them out of any group
+    let g = resolve(&e, items[0], &svc, &text, &c, &[("9:0|11:0", Verdict::Different)], &[]);
+    assert!(ids(&g).iter().all(|(s, _)| !s.contains(&"9:0".to_string())));
+
+    // "retake" on 21:0|22:0 makes a group of three
+    let g = resolve(&e, items[0], &svc, &text, &c, &[("21:0|22:0", Verdict::Retake)], &["17:0|18:0"]);
+    assert!(ids(&g).contains(&(v(&["20:0", "21:0", "22:0"]), true)));
+
+    // "retake" on the unsure pair makes that group likely
+    let g = resolve(&e, items[0], &svc, &text, &c, &[("17:0|18:0", Verdict::Retake)], &[]);
+    assert!(ids(&g).contains(&(v(&["17:0", "18:0"]), true)));
+
+    // answering nothing: the pretend model decides everything it can
+    let g = resolve(&e, items[0], &svc, &text, &c, &[], &[]);
+    assert!(ids(&g).contains(&(v(&["17:0", "18:0"]), false)), "still unsure");
+    assert!(ids(&g).contains(&(v(&["9:0", "11:0"]), true)), "the model said yes");
+}
+
+#[test]
+fn the_service_never_says_what_to_keep() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    let svc = FakeService::default();
+    let (text, c) = analyse(&e, items[0], &svc);
+    let request = ResolveRequest { item: items[0], labels: LabelsRequest { job: c.job.clone(), labels: vec![], skipped: vec![] }, candidates: Some(text) };
+    let json = done(&mut svc.resolve(request));
+    for forbidden in ["suggested_keep", "keep", "note", "reason", "score", "pairs"] {
+        assert!(!json.contains(&format!("\"{forbidden}\"")), "the groups document must not contain “{forbidden}”: {json}");
+    }
+}
+
+#[test]
+fn the_service_can_answer_with_groups_at_once_cancel_fail_or_answer_for_another_file() {
     let Some((e, items)) = project(&["a.mp4"]) else { return };
     let req = || e.analysis_requests().unwrap().remove(0);
 
-    let mut job = FakeAnalyzer { steps: 50, step_delay: Duration::from_millis(30), ..Default::default() }.start(req());
+    let mut job = FakeService { skip_questions: true, ..Default::default() }.analyze(req());
+    let Checked::Groups(g) = e.read_review(&done(&mut job), items[0]).unwrap() else { panic!("not groups") };
+    assert!(!g.groups.is_empty(), "nothing to ask: groups straight away");
+
+    let mut job = FakeService { steps: 100, step_delay: Duration::from_millis(30), ..Default::default() }.analyze(req());
     std::thread::sleep(Duration::from_millis(100));
     job.cancel();
     assert_eq!(finish(&mut job).1, JobState::Cancelled);
 
-    let mut job = FakeAnalyzer { fail_with: Some("the model is not installed".into()), ..Default::default() }.start(req());
+    let mut job = FakeService { fail_analyze: Some("the model is not installed".into()), ..Default::default() }.analyze(req());
     assert_eq!(finish(&mut job).1, JobState::Failed("the model is not installed".into()));
 
-    let mut job = FakeAnalyzer { wrong_length: true, ..Default::default() }.start(req());
-    let JobState::Done(json) = finish(&mut job).1 else { panic!("not done") };
-    assert!(matches!(e.read_analysis(&json, items[0]), Err(EditorError::Invalid(m)) if m.contains("different file")));
+    let mut job = FakeService { wrong_length: true, ..Default::default() }.analyze(req());
+    let text = done(&mut job);
+    assert!(matches!(e.read_review(&text, items[0]), Err(EditorError::Invalid(m)) if m.contains("different file")));
+
+    let svc = FakeService { fail_resolve: Some("out of memory".into()), ..Default::default() };
+    let (t, c) = analyse(&e, items[0], &FakeService::default());
+    let labels = LabelsRequest { job: c.job, labels: vec![], skipped: vec![] };
+    let mut job = svc.resolve(ResolveRequest { item: items[0], labels, candidates: Some(t) });
+    assert_eq!(finish(&mut job).1, JobState::Failed("out of memory".into()));
+}
+
+#[test]
+fn the_ai_is_optional_and_its_advice_is_checked() {
+    let Some((e, items)) = project(&["a.mp4"]) else { return };
+    assert!(FakeService::default().capabilities().adjudicate);
+    let off = FakeService { adjudicate: false, ..Default::default() };
+    assert!(!off.capabilities().adjudicate);
+    let g = {
+        let (text, c) = analyse(&e, items[0], &off);
+        resolve(&e, items[0], &off, &text, &c, &[], &[])
+    };
+    assert!(
+        off.adjudicate(AdjudicateRequest { item: items[0], job: g.job.clone(), groups: g.groups.clone() }).is_none(),
+        "a service without the extension has no AI"
+    );
+
+    let on = FakeService::default();
+    let mut job = on.adjudicate(AdjudicateRequest { item: items[0], job: g.job.clone(), groups: g.groups.clone() }).unwrap();
+    let (advice, notes) = parse_advice(&done(&mut job), &g.groups).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+    assert_eq!(advice.len(), g.groups.len());
+    for a in &advice {
+        let group = g.groups.iter().find(|x| x.id == a.group).unwrap();
+        assert_eq!(a.keep, vec![group.sentences.last().unwrap().id.clone()]);
+    }
+    let _ = review::SCHEMA_V2;
 }
 
 #[test]
@@ -116,14 +247,13 @@ fn the_request_lists_each_file_once_with_the_parts_that_are_used() {
     assert_eq!(r[0].used.len(), 1, "2-10 and 0-10 overlap, so they are one used part: {:?}", r[0].used);
     assert!(s_of(r[0].used[0].0).abs() < 0.04 && (s_of(r[0].used[0].1) - 10.0).abs() < 0.04);
 
-    // nothing on the timeline to look at
     let mut empty = Editor::new();
     empty.new_project("E").unwrap();
     assert!(matches!(empty.analysis_requests(), Err(EditorError::NotAvailable(_))));
 }
 
 #[test]
-fn a_file_that_cannot_be_read_is_not_sent_to_the_detector() {
+fn a_file_that_cannot_be_read_is_not_sent_to_the_service() {
     let Some((mut e, _)) = project(&["a.mp4"]) else { return };
     let dir = scratch("analyzer-offline");
     let file = dir.join("p.fcproj");
@@ -136,7 +266,7 @@ fn a_file_that_cannot_be_read_is_not_sent_to_the_detector() {
 }
 
 #[test]
-fn file_time_maps_to_where_it_is_on_the_timeline() {
+fn file_time_maps_to_where_it_is_on_the_timeline_and_short_spans_are_still_present() {
     let Some((mut e, items)) = project(&["a.mp4"]) else { return };
     let clip = e.sequence().unwrap().tracks[0].clips[0].id;
     e.trim(clip, Edge::Start, secs(1.0), TrimMode::Ripple).unwrap();
@@ -146,22 +276,23 @@ fn file_time_maps_to_where_it_is_on_the_timeline() {
     assert!((s_of(r[0].0) - (start + 2.0)).abs() < 0.04 && (s_of(r[0].1) - (start + 3.0)).abs() < 0.04, "{r:?}");
     assert!(e.timeline_ranges(items[0], &proposal("gone", 0.1, 0.9)).is_empty(), "before the used part");
     assert!(e.timeline_ranges(ItemId(987_654), &proposal("x", 3.0, 4.0)).is_empty());
+
+    // a span under one frame is still "on the timeline" when it is
+    use simplecut_core::retake::Presence;
+    assert_eq!(e.presence_of(items[0], secs(5.0), secs(5.02)), Presence::On);
+    assert_eq!(e.presence_of(items[0], secs(0.1), secs(0.12)), Presence::Off);
+    assert_eq!(e.presence_of(items[0], secs(5.0), secs(5.0)), Presence::Off, "an empty span is nowhere");
 }
 
 #[test]
-fn an_analysis_file_finds_its_own_media_by_length_then_by_name() {
+fn an_analysis_finds_its_own_media_by_length_then_by_name() {
     let Some((e, items)) = project(&["first.mp4", "second.mp4"]) else { return };
-    let doc = |path: &str, dur: f64| {
-        let json = serde_json::json!({"schema": "simplecut.retakes/1", "media": {"path": path, "duration_seconds": dur}, "proposals": []});
-        simplecut_core::retake::parse(&json.to_string()).unwrap()
-    };
-    // two files of the same length: the name decides (either kind of slash, any case)
-    assert_eq!(e.find_media_for(&doc("C:\\videos\\SECOND.mp4", 10.0)).unwrap(), items[1]);
-    assert_eq!(e.find_media_for(&doc("/home/me/first.mp4", 10.1)).unwrap(), items[0]);
-    // same length, no name to go by: refuse to guess
-    assert!(matches!(e.find_media_for(&doc("other.mp4", 10.0)), Err(EditorError::Invalid(m)) if m.contains("More than one")));
-    // no file that long
-    assert!(matches!(e.find_media_for(&doc("first.mp4", 99.0)), Err(EditorError::Invalid(m)) if m.contains("None of the files")));
+    assert_eq!(e.find_media_by("C:\\videos\\SECOND.mp4", 10.0).unwrap(), items[1]);
+    assert_eq!(e.find_media_by("/home/me/first.mp4", 10.1).unwrap(), items[0]);
+    assert!(matches!(e.find_media_by("other.mp4", 10.0), Err(EditorError::Invalid(m)) if m.contains("More than one")));
+    assert!(matches!(e.find_media_by("first.mp4", 99.0), Err(EditorError::Invalid(m)) if m.contains("None of the files")));
+    let doc = r#"{"schema":"simplecut.retakes/2","stage":"groups","media":{"path":"x/second.mp4","duration_seconds":10.0},"groups":[]}"#.to_string();
+    assert_eq!(e.find_media_for_review(&doc).unwrap(), items[1]);
 }
 
 #[test]

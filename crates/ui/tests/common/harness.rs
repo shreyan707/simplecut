@@ -60,11 +60,11 @@ pub fn window(script: Script) -> Window {
     window_with(script, None)
 }
 
-/// A window with a retake detector connected (or none).
-pub fn window_with(script: Script, analyzer: Option<Box<dyn simplecut_core::Analyzer>>) -> Window {
+/// A window with a retake service connected (or none).
+pub fn window_with(script: Script, service: Option<Box<dyn simplecut_core::RetakeService>>) -> Window {
     let mut h = Harness::builder().with_size(egui::vec2(1300.0, 820.0)).with_max_steps(10_000).build_eframe(move |cc| {
         let mut app = SimpleCutApp::new(&cc.egui_ctx, Box::new(script), None);
-        app.set_analyzer(analyzer);
+        app.set_service(service);
         app
     });
     h.step();
@@ -115,12 +115,12 @@ pub fn with_media() -> (Window, Script, PathBuf) {
     (h, script, dir)
 }
 
-/// Like [`with_media`], with a detector connected.
-pub fn with_media_and_detector(analyzer: simplecut_core::FakeAnalyzer) -> (Window, Script, PathBuf) {
+/// Like [`with_media`], with a retake service connected.
+pub fn with_media_and_service(service: simplecut_core::FakeService) -> (Window, Script, PathBuf) {
     let dir = scratch("window-retakes");
     let script = Script::default();
     script.media.lock().unwrap().push_back(vec![make_clip(&dir, "talk.mp4", 4), make_music(&dir, "bed.wav", 6)]);
-    let mut h = window_with(script.clone(), Some(Box::new(analyzer)));
+    let mut h = window_with(script.clone(), Some(Box::new(service)));
     click(&mut h, "Import");
     step_until(&mut h, "the import", |a| a.editor().media().len() == 2);
     (h, script, dir)
