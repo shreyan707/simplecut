@@ -295,13 +295,19 @@ Tests to add: core `groups()` (ordering, singleton without `group`, label number
 
 ## 15. Retake review v2 (DONE, replaces sections 12-14 for the UI)
 
-Contract: docs/retake-contract.md (/2). Core: crates/core/src/review.rs (types, validation), analyzer.rs
-(RetakeService trait, FakeService). UI: crates/ui/src/retakes.rs, a wizard: Analyzing, Questions (mark
-pairs, Next), Resolving, Review (Keep ticks per sentence, everything starts kept, Remove cuts the rest).
-Optional "Ask AI to choose" only when capabilities say so. Answers are logged to labels.jsonl first.
-Limits: one video file per review; /1 files are no longer read; the real HTTP client for the owner's
-Python service is not written yet (use SIMPLECUT_FAKE_RETAKES=1 to try the flow with the fake one).
-Tests: crates/ui/tests/retake_window.rs, crates/core/tests/analyzer.rs.
+Contract: docs/retake-contract.md (/2). Core: crates/core/src/review.rs (types, validation, span editing, groups export), analyzer.rs
+(RetakeService trait, FakeService), player.rs (skips during preview playback), editor.rs (file_time_at). UI: crates/ui/src/retakes.rs,
+timeline.rs (overview seek slider, draggable sentence edges, highlight strength), a wizard: Analyzing, Questions (mark pairs, Next),
+Resolving, Review (Keep ticks per sentence, everything starts kept, "Remove all" to delete entire sections, Remove cuts the rest).
+Optional "Ask AI to choose" only when capabilities say so. Answers logged to labels.jsonl first; span adjustments logged to span_edits.jsonl.
+Groups exportable to simplecut.retakes/2 stage: "groups" file via "Save groups...".
+Limits & findings:
+- One video file per review; /1 files are no longer read.
+- The real HTTP client for the owner's Python service is not written yet (use SIMPLECUT_FAKE_RETAKES=1 to try the flow with the fake one).
+- Timeline cutting snaps to sequence frame boundaries (`rate.snap`); sub-frame span edits round to whole frames upon Remove.
+- Music on audio track 2 is preserved by Remove (`CutScope::MainTracks`), so preview skipping is approximate for the music bed.
+- Span edits live in the active review session (`Review.groups`) rather than project history; each edited sentence has a "Reset span" button reverting to `Review.original`.
+Tests: crates/ui/tests/retake_window.rs, crates/ui/tests/timeline_edit.rs, crates/core/tests/analyzer.rs, crates/core/tests/playback.rs.
 
 ## 16. NEXT WORK (assigned to the coding agent): delete anything, preview the cuts, adjustable spans, seek slider
 
