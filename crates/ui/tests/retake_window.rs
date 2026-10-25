@@ -648,3 +648,34 @@ fn sentence_edge_coinciding_with_clip_edge_wins_over_clip_trim() {
     let clip1_after = &seq_after.tracks[0].clips[1];
     assert!(clip1_after.end() < clip1.end(), "clip trim still works where no sentence edge is");
 }
+
+#[test]
+fn rejected_span_edits_are_not_logged_and_clamped_ones_log_the_stored_value() {
+    if skip() {
+        return;
+    }
+    let (mut h, _, dir) = ready_with_script(FakeService::default());
+    let log_path = dir.join("span_edits.jsonl");
+    h.state_mut().set_span_log(Some(log_path.clone()));
+    to_review(&mut h);
+    let (s0, e0) = h.state().sentence_span_f64("3:0").unwrap();
+    let (s1, _) = h.state().sentence_span_f64("4:0").unwrap();
+    let lines = |p: &std::path::Path| std::fs::read_to_string(p).map(|t| t.lines().filter(|l| !l.trim().is_empty()).count()).unwrap_or(0);
+
+    // reversed, not a number and past the file are refused: nothing changes, nothing is logged, the user is told
+    for (start, end) in [(e0, s0), (f64::NAN, e0), (s0, 1.0e9)] {
+        h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start, end });
+        h.step();
+        assert_eq!(h.state().sentence_span_f64("3:0"), Some((s0, e0)), "unchanged");
+        assert_eq!(lines(&log_path), 0, "a refused edit is not an edit");
+        assert!(h.state().banner().is_some_and(|b| b.error), "{:?}", h.state().banner());
+    }
+
+    // an end past the neighbour is clamped; the log holds what was stored, not what was asked
+    h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start: s0, end: s1 + 0.1 });
+    h.step();
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!((v["new"]["end"].as_f64().unwrap() - s1).abs() < 1e-4, "{v}");
+    assert_eq!(lines(&log_path), 1);
+}

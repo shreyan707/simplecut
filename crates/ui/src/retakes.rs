@@ -25,6 +25,8 @@ use simplecut_core::{
 use crate::app::{Action, SimpleCutApp, Source};
 use crate::{format, theme};
 
+const TICKS_PER_SECOND: f64 = 254_016_000_000.0;
+
 /// Who set a sentence's keep tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -916,40 +918,56 @@ impl SimpleCutApp {
     fn set_sentence_span(&mut self, sentence: &str, start: f64, end: f64) {
         let Some(Stage::Review(r)) = &mut self.retakes.stage else { return };
         let Some(entry) = self.editor.media_entry(r.item) else { return };
-        let media_duration = entry.duration.0 as f64 / 254_016_000_000.0;
+        let media_duration = entry.duration.0 as f64 / TICKS_PER_SECOND;
         let Some(group) = r.groups.iter_mut().find(|g| g.sentences.iter().any(|s| s.id == sentence)) else { return };
         let Some(sent) = group.sentences.iter().find(|s| s.id == sentence) else { return };
-        let old = (sent.start.0 as f64 / 254_016_000_000.0, sent.end.0 as f64 / 254_016_000_000.0);
+        let old = (sent.start.0 as f64 / TICKS_PER_SECOND, sent.end.0 as f64 / TICKS_PER_SECOND);
         if (old.0 - start).abs() < 1e-4 && (old.1 - end).abs() < 1e-4 {
             return;
         }
-        if let Some(path) = &self.retakes.span_log {
-            let _ = append_span_edit(path, &r.job, sentence, old, (start, end));
+        if let Err(e) = group.set_span(sentence, start, end, media_duration) {
+            let msg = e.to_string();
+            self.fail_text(&msg);
+            return;
         }
-        let _ = group.set_span(sentence, start, end, media_duration);
+        // log what was stored (it may have been clamped to a neighbour), and only edits that happened
+        let Some(sent) = group.sentences.iter().find(|s| s.id == sentence) else { return };
+        let new = (sent.start.0 as f64 / TICKS_PER_SECOND, sent.end.0 as f64 / TICKS_PER_SECOND);
+        if new != old
+            && let Some(path) = self.retakes.span_log.clone()
+            && let Err(e) = append_span_edit(&path, &r.job, sentence, old, new)
+        {
+            log::warn!("could not write {}: {e}", path.display());
+        }
     }
 
     fn reset_sentence_span(&mut self, sentence: &str) {
         let Some(Stage::Review(r)) = &mut self.retakes.stage else { return };
         let Some(orig) = r.original.get(sentence).copied() else { return };
         let Some(entry) = self.editor.media_entry(r.item) else { return };
-        let media_duration = entry.duration.0 as f64 / 254_016_000_000.0;
+        let media_duration = entry.duration.0 as f64 / TICKS_PER_SECOND;
         let Some(group) = r.groups.iter_mut().find(|g| g.sentences.iter().any(|s| s.id == sentence)) else { return };
         let Some(sent) = group.sentences.iter().find(|s| s.id == sentence) else { return };
-        let old = (sent.start.0 as f64 / 254_016_000_000.0, sent.end.0 as f64 / 254_016_000_000.0);
-        let orig_sec = (orig.0.0 as f64 / 254_016_000_000.0, orig.1.0 as f64 / 254_016_000_000.0);
-        if let Some(path) = &self.retakes.span_log {
-            let _ = append_span_edit(path, &r.job, sentence, old, orig_sec);
+        let old = (sent.start.0 as f64 / TICKS_PER_SECOND, sent.end.0 as f64 / TICKS_PER_SECOND);
+        let orig_sec = (orig.0.0 as f64 / TICKS_PER_SECOND, orig.1.0 as f64 / TICKS_PER_SECOND);
+        if let Err(e) = group.set_span(sentence, orig_sec.0, orig_sec.1, media_duration) {
+            let msg = e.to_string();
+            self.fail_text(&msg);
+            return;
         }
-        if group.set_span(sentence, orig_sec.0, orig_sec.1, media_duration).is_ok() {
-            if let Some(sent) = group.sentences.iter_mut().find(|s| s.id == sentence) {
-                sent.start = orig.0;
-                sent.end = orig.1;
-            }
-            if let (Some(min_s), Some(max_e)) = (group.sentences.iter().map(|s| s.start).min(), group.sentences.iter().map(|s| s.end).max()) {
-                group.start = min_s;
-                group.end = max_e;
-            }
+        if let Some(sent) = group.sentences.iter_mut().find(|s| s.id == sentence) {
+            sent.start = orig.0;
+            sent.end = orig.1;
+        }
+        if let (Some(min_s), Some(max_e)) = (group.sentences.iter().map(|s| s.start).min(), group.sentences.iter().map(|s| s.end).max()) {
+            group.start = min_s;
+            group.end = max_e;
+        }
+        if old != orig_sec
+            && let Some(path) = self.retakes.span_log.clone()
+            && let Err(e) = append_span_edit(&path, &r.job, sentence, old, orig_sec)
+        {
+            log::warn!("could not write {}: {e}", path.display());
         }
     }
 

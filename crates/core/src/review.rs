@@ -231,14 +231,14 @@ impl ReviewGroup {
         let mut end_tick = Tick::from_seconds_f64(end);
 
         // Clamp to neighbouring sentences of the same group
-        if idx > 0 {
-            let prev_end = self.sentences[idx - 1].end;
+        if let Some(prev) = idx.checked_sub(1).and_then(|i| self.sentences.get(i)) {
+            let prev_end = prev.end;
             if start_tick < prev_end {
                 start_tick = prev_end;
             }
         }
-        if idx + 1 < self.sentences.len() {
-            let next_start = self.sentences[idx + 1].start;
+        if let Some(next) = self.sentences.get(idx + 1) {
+            let next_start = next.start;
             if end_tick > next_start {
                 end_tick = next_start;
             }
@@ -249,8 +249,9 @@ impl ReviewGroup {
             return Err(EditorError::Invalid("Span cannot cross neighbouring sentence or become shorter than minimum cut length.".into()));
         }
 
-        self.sentences[idx].start = start_tick;
-        self.sentences[idx].end = end_tick;
+        let Some(target) = self.sentences.get_mut(idx) else { return Err(EditorError::Invalid("Sentence not found.".into())) };
+        target.start = start_tick;
+        target.end = end_tick;
 
         if let (Some(min_s), Some(max_e)) = (self.sentences.iter().map(|s| s.start).min(), self.sentences.iter().map(|s| s.end).max()) {
             self.start = min_s;
