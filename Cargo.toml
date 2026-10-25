@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,9 +21,20 @@ filmcraft-export = { path = "../filmcraft/crates/export" }
 filmcraft-engine = { path = "../filmcraft/crates/engine" }
 filmcraft-platform = { path = "../filmcraft/crates/platform" }
 
+simplecut-core = { path = "crates/core" }
+simplecut-ui = { path = "crates/ui" }
+
 thiserror = "2"
 serde_json = "1"
 log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+
+# the window: the same egui / eframe as FilmCraft
+egui = "0.36"
+eframe = { version = "0.36", default-features = false }
+egui_kittest = "0.36"
+rfd = "0.17"
+cpal = "0.16"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

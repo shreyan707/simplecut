@@ -22,7 +22,7 @@ pub use view::{ClipView, ImportReport, MediaEntry, SequenceView, TrackView};
 
 pub use filmcraft_media::MediaKind;
 pub use filmcraft_project::{ClipId, TrackId, TrackKind};
-pub use filmcraft_time::Tick;
+pub use filmcraft_time::{FrameRate, Tick};
 
 /// The FilmCraft commit this crate is built and tested against.
 pub const FILMCRAFT_BASE_COMMIT: &str = "a504f3c5";

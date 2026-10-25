@@ -110,6 +110,8 @@ impl Editor {
         // the template is the starting point, not something to undo
         self.session.history.undo.clear();
         self.session.history.redo.clear();
+        // and a project nobody has touched yet has nothing to save
+        self.session.saved_revision = self.session.revision;
         Ok(())
     }
 

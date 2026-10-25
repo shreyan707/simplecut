@@ -78,6 +78,9 @@ fn a_new_project_has_video_dialogue_and_music_tracks() {
     assert_eq!(v.clip_count(), 0);
     assert_eq!(e.project_name(), "My video");
     assert!(!e.can_undo(), "the template is not something to undo");
+    assert!(!e.is_dirty(), "an untouched new project has nothing to save");
+    e.import(&[]).unwrap_err();
+    assert!(!e.is_dirty(), "a failed action changes nothing");
 }
 
 #[test]
