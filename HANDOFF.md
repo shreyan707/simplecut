@@ -186,3 +186,15 @@ The owner's pipeline is Python (`repository_walkthrough.md`): WhisperX transcrib
 2. `cargo run -p simplecut`, import a clip and a music file, add both, split, drag, trim, play.
 3. Read `crates/ui/src/app.rs` (Actions and `perform`) and `crates/core/src/editor.rs`; they are the spine.
 4. Start step 5 as described above. Add tests in the same style as `crates/ui/tests/timeline_edit.rs` (real events, real ffmpeg media) and `crates/core/tests/*.rs` (headless).
+
+## 12. Retake contract: DECIDED (step 7a, done)
+
+The owner has not run the pipeline end to end (it is still being trained and returns nothing), so **SimpleCut defines the data format and the pipeline conforms to it**. Do not change it casually.
+
+- Spec for the pipeline authors: `docs/retake-contract.md` (schema `simplecut.retakes/1`, fields, confidence mapping from the pipeline's own outputs, validation rules). Example: `docs/examples/retake-sample.json` (parsed by a unit test, so the doc and code cannot drift).
+- Code: `crates/core/src/retake.rs` and tests in the same file plus `crates/core/tests/retake.rs`.
+  - `parse(json)` -> `RetakeDocument`; `validate(doc, item, media_duration)` -> `Analysis { proposals, rejected }`. A document made for a different file (length differs by more than 0.5 s) is refused whole; unusable proposals are dropped one by one with a reason.
+  - `Editor::read_analysis(json, item)` and `Editor::apply_cuts(item, &proposals, CutScope)`.
+  - Times are seconds on the media file's own clock. `apply_cuts` converts them to timeline time through every clip showing that file (trimmed, moved, or used twice are all right), merges overlaps, rounds to frames, and cuts with `filmcraft_edit::extract` inside one `edit_sequence` call: one undo step, picture and sound together, gaps closed. `CutScope::MainTracks` (default) leaves music whole; `AllTracks` cuts the music at the same timeline moments to keep it aligned. Speed-changed clips are skipped with a note.
+- Remaining for step 7 (7b): an `Analyzer` trait + job (background, progress, cancel) and a `FakeAnalyzer` returning canned `Analysis`; the hidden-until-registered "Remove Retakes" toolbar button; a right-hand review column (approve/reject, confidence badge, reason, kept/removed text, "go to"); proposals drawn on the timeline as ranges; "Apply" calls `apply_cuts` with the approved ones. `decision: review` is never pre-approved; `decision: remove` is pre-approved only above a confidence threshold (suggest 0.8, configurable).
+- Open question for the owner: the pipeline must put audio-extracted times on the container clock (see the contract's note about stream start offsets). Verify with one real file once the pipeline produces output.
