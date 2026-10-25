@@ -274,6 +274,16 @@ impl SimpleCutApp {
     }
 
     pub fn perform(&mut self, action: Action) {
+        if self.is_exporting() {
+            match action {
+                Action::CancelExport | Action::DismissBanner | Action::OpenFolder(_) => {}
+                Action::Seek(_) | Action::SeekTimeline(_) | Action::SeekStart | Action::SeekEnd | Action::Step(_) => {}
+                _ => {
+                    self.fail(&EditorError::NotAvailable("Cannot make changes while an export is in progress.".into()));
+                    return;
+                }
+            }
+        }
         match action {
             Action::NewProject => self.guard_unsaved(Then::New),
             Action::OpenProject => {
@@ -913,7 +923,9 @@ impl SimpleCutApp {
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.handle_close(&ctx);
-        self.handle_drops(&ctx);
+        if !self.is_exporting() {
+            self.handle_drops(&ctx);
+        }
         self.pump(&ctx);
         if self.modal.is_none() && self.active_export.is_none() {
             self.handle_keys(&ctx);
@@ -921,9 +933,15 @@ impl SimpleCutApp {
 
         egui::Panel::top("toolbar").show(ui, |ui| toolbar::show(self, ui));
         egui::Panel::bottom("status").show_separator_line(false).exact_size(28.0).show(ui, |ui| crate::status::show(self, ui));
-        egui::Panel::bottom("timeline").resizable(true).default_size(250.0).min_size(170.0).show(ui, |ui| timeline::show(self, ui));
-        egui::Panel::left("library").resizable(true).default_size(330.0).min_size(240.0).show(ui, |ui| library::show(self, ui));
-        egui::CentralPanel::default().show(ui, |ui| preview::show(self, ui));
+        egui::Panel::bottom("timeline").resizable(true).default_size(250.0).min_size(170.0).show(ui, |ui| {
+            ui.add_enabled_ui(!self.is_exporting(), |ui| timeline::show(self, ui));
+        });
+        egui::Panel::left("library").resizable(true).default_size(330.0).min_size(240.0).show(ui, |ui| {
+            ui.add_enabled_ui(!self.is_exporting(), |ui| library::show(self, ui));
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.add_enabled_ui(!self.is_exporting(), |ui| preview::show(self, ui));
+        });
 
         self.modal_ui(&ctx);
 

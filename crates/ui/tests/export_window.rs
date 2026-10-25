@@ -132,3 +132,45 @@ fn ctrl_e_opens_export_dialog() {
     h.get_by_label("Export video");
     click(&mut h, "Cancel");
 }
+
+#[test]
+fn export_blocks_editing_interactions_while_running() {
+    if skip() {
+        return;
+    }
+    let (mut h, script, dir) = with_media();
+    click(&mut h, "Add to timeline");
+    let initial_clip_count = h.state().editor().sequence().unwrap().clip_count();
+
+    let out_file = dir.join("locked_export.mp4");
+    script.export.lock().unwrap().push_back(out_file);
+
+    click(&mut h, "Export");
+    click(&mut h, "Browse...");
+    click(&mut h, "Start export");
+    assert!(h.state().is_exporting());
+
+    // 1. Toolbar editing buttons are disabled
+    assert!(h.get_by_label("Split").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Undo").accesskit_node().is_disabled());
+    assert!(h.get_by_label("Import").accesskit_node().is_disabled());
+
+    // 2. Timeline lanes widget is disabled by panel-level disabled state
+    assert!(h.get_by_label("Timeline lanes").accesskit_node().is_disabled());
+
+    // 3. Attempting mutating actions directly is rejected with an error banner
+    let music = h.state().editor().media().iter().find(|m| m.name == "bed.wav").unwrap().id;
+    h.state_mut().perform(Action::AddToTimeline(music, simplecut_core::Lane::Music));
+    h.step();
+    assert_eq!(
+        h.state().banner().map(|b| (b.error, b.text.as_str())),
+        Some((true, "This can't be done right now: Cannot make changes while an export is in progress."))
+    );
+    assert_eq!(h.state().editor().sequence().unwrap().clip_count(), initial_clip_count, "clip count unchanged");
+
+    // 4. Cancel export restores normal interaction
+    click(&mut h, "Cancel export");
+    assert!(!h.state().is_exporting());
+    assert!(!h.get_by_label("Split").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Timeline lanes").accesskit_node().is_disabled());
+}

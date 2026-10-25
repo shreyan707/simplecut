@@ -48,7 +48,7 @@ fn importing_fills_the_library_with_thumbnails_and_previews_the_first_file() {
     h.get_by_label("bed.wav");
 
     step_until(&mut h, "thumbnails", |a| a.thumbnail_state(video) == Some("ready") && a.thumbnail_state(music) == Some("none"));
-    step_until(&mut h, "the preview picture", |a| a.preview_size().is_some());
+    step_until(&mut h, "the preview picture", |a| a.preview_size().is_some_and(|[w, hgt]| w * 3 == hgt * 4));
     let [w, hgt] = h.state().preview_size().unwrap();
     assert_eq!(w * 3, hgt * 4, "the 4:3 clip keeps its shape: {w}x{hgt}");
 }
