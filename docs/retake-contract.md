@@ -48,7 +48,7 @@ expanded. No pairs, no keeper, no notes, no scores.
   its sentences (10 ms tolerance).
 - Advice is checked the same way: an unknown id, or a reply that keeps nothing, is ignored for that
   group and noted.
-- Documents over 20 MB are refused.
+- Documents over 64 MiB are refused.
 
 ## In the editor
 
