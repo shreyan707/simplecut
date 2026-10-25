@@ -9,6 +9,7 @@
 mod common;
 
 use common::harness::{Script, click, item, skip, step_until, window, window_with, with_media_and_service};
+use egui::{Pos2, pos2, vec2};
 use egui_kittest::kittest::{NodeT, Queryable};
 use simplecut_core::{FakeService, Lane, Tick, Verdict};
 use simplecut_ui::Action;
@@ -20,6 +21,30 @@ fn s_of(t: Tick) -> f64 {
 }
 
 type Win = common::harness::Window;
+
+fn ready_with_script(service: FakeService) -> (Win, Script, std::path::PathBuf) {
+    let (mut h, script, dir) = with_media_and_service(service);
+    let video = item(&h, "talk.mp4");
+    h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
+    h.state_mut().perform(Action::SelectClips { clips: vec![], add: false });
+    h.step();
+    h.step();
+    (h, script, dir)
+}
+
+fn drag_mouse(h: &mut Win, from: Pos2, to: Pos2) {
+    h.hover_at(from);
+    h.step();
+    h.drag_at(from);
+    h.step();
+    for i in 1..=5 {
+        h.hover_at(from + (to - from) * (i as f32 / 5.0));
+        h.step();
+    }
+    h.drop_at(to);
+    h.step();
+    h.step();
+}
 
 fn ready(service: FakeService) -> (Win, std::path::PathBuf) {
     let (mut h, _, dir) = with_media_and_service(service);
@@ -415,4 +440,211 @@ fn preview_skips_unticked_sentences_checkbox_toggle_remove_and_undo() {
     h.state_mut().perform(Action::CloseReview);
     h.step();
     assert!(h.state().player().current_skips().is_empty(), "closing review clears skips");
+}
+
+#[test]
+fn drag_sentence_edge_with_real_mouse_updates_sentence_group_span_and_rects() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+
+    let (s_orig, e_orig) = h.state().sentence_span_f64("3:0").expect("sentence 3:0 exists");
+
+    // Untick 3:0 so it becomes Cut
+    h.state_mut().perform(Action::SetKeep { sentence: "3:0".into(), keep: false });
+    h.step();
+
+    let rects_before = h.state().review_marker_rects();
+    assert!(!rects_before.is_empty(), "marker rects exist for cut sentence");
+    let r3 = rects_before[0];
+    let from = pos2(r3.right(), r3.center().y);
+    let to = pos2(r3.right() + 15.0, r3.center().y);
+
+    drag_mouse(&mut h, from, to);
+
+    let (s_new, e_new) = h.state().sentence_span_f64("3:0").expect("sentence 3:0 exists");
+    assert!((s_new - s_orig).abs() < 1e-4, "start stayed at {s_orig}");
+    assert!(e_new > e_orig, "end was dragged later: {e_new} > {e_orig}");
+
+    let g_span = h.state().review_group_spans()[0];
+    assert!((s_of(g_span.0) - s_orig).abs() < 1e-4);
+
+    let rects_after = h.state().review_marker_rects();
+    assert!(rects_after[0].width() > r3.width(), "marker rect widened");
+    assert!(h.state().is_sentence_span_edited("3:0"));
+}
+
+#[test]
+fn remove_cuts_exact_edited_span_with_exact_source_offsets() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+    to_review(&mut h);
+
+    let (s_orig, _e_orig) = h.state().sentence_span_f64("3:0").expect("sentence 3:0 exists");
+    // Untick 3:0 and edit its span to frame-aligned seconds (0.30s and 0.40s at 30fps)
+    let new_s = 0.30;
+    let new_e = 0.40;
+    assert!(new_s > s_orig, "new_s is different from original start");
+    h.state_mut().perform(Action::SetKeep { sentence: "3:0".into(), keep: false });
+    h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start: new_s, end: new_e });
+    h.step();
+
+    // Remove cuts 3:0
+    h.state_mut().perform(Action::ApplyRetakes);
+    h.step();
+
+    let seq = h.state().editor().sequence().expect("sequence exists");
+    let v_track = &seq.tracks[0];
+    assert_eq!(v_track.clips.len(), 2, "video was cut into 2 pieces");
+
+    let c0 = &v_track.clips[0];
+    assert_eq!(s_of(c0.start), 0.0);
+    assert!((s_of(c0.duration) - new_s).abs() < 1e-4);
+    assert_eq!(s_of(c0.source_in), 0.0);
+
+    let c1 = &v_track.clips[1];
+    assert!((s_of(c1.start) - new_s).abs() < 1e-4);
+    assert!((s_of(c1.source_in) - new_e).abs() < 1e-4);
+    assert!((s_of(c1.duration) - (4.0 - new_e)).abs() < 1e-4);
+}
+
+#[test]
+fn numeric_edit_clamping_neighbour_reset_span_and_log_content() {
+    if skip() {
+        return;
+    }
+    let (mut h, _, dir) = ready_with_script(FakeService::default());
+    let log_path = dir.join("span_edits.jsonl");
+    h.state_mut().set_span_log(Some(log_path.clone()));
+
+    to_review(&mut h);
+
+    let (s0, e0) = h.state().sentence_span_f64("3:0").unwrap();
+    let (s1, _) = h.state().sentence_span_f64("4:0").unwrap();
+
+    // Edit start of 3:0
+    let target_s = s0 + 0.03;
+    h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start: target_s, end: e0 });
+    h.step();
+    let (s, e) = h.state().sentence_span_f64("3:0").unwrap();
+    assert!((s - target_s).abs() < 1e-4);
+    assert!((e - e0).abs() < 1e-4);
+    assert!(h.state().is_sentence_span_edited("3:0"));
+
+    // Clamping against neighbour 4:0 (which starts at s1)
+    let past_neighbour = s1 + 0.10;
+    h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start: target_s, end: past_neighbour });
+    h.step();
+    let (_, e_clamped) = h.state().sentence_span_f64("3:0").unwrap();
+    assert!((e_clamped - s1).abs() < 1e-4, "end clamped to neighbour start: {e_clamped} vs {s1}");
+
+    // Reset span
+    click(&mut h, "Reset span of 3:0");
+    h.step();
+    let (s_reset, e_reset) = h.state().sentence_span_f64("3:0").unwrap();
+    assert!((s_reset - s0).abs() < 1e-4);
+    assert!((e_reset - e0).abs() < 1e-4);
+    assert!(!h.state().is_sentence_span_edited("3:0"));
+
+    // Verify span_edits.jsonl content
+    assert!(log_path.exists());
+    let text = std::fs::read_to_string(&log_path).expect("read span log");
+    let lines: Vec<serde_json::Value> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert!(lines.len() >= 3, "logged the edits and reset");
+    for line in &lines {
+        assert_eq!(line["sentence"], "3:0");
+        assert_eq!(line["source"], "user");
+        assert!(line["old"]["start"].is_number());
+        assert!(line["old"]["end"].is_number());
+        assert!(line["new"]["start"].is_number());
+        assert!(line["new"]["end"].is_number());
+    }
+}
+
+#[test]
+fn saved_groups_file_is_accepted_by_read_review_and_holds_edited_times() {
+    if skip() {
+        return;
+    }
+    let (mut h, script, dir) = ready_with_script(FakeService::default());
+    to_review(&mut h);
+
+    let (s0, e0) = h.state().sentence_span_f64("3:0").unwrap();
+    let target_s = s0 + 0.04;
+    let target_e = e0 - 0.02;
+
+    // Edit 3:0 span
+    h.state_mut().perform(Action::SetSentenceSpan { sentence: "3:0".into(), start: target_s, end: target_e });
+    h.step();
+
+    let save_path = dir.join("saved_groups.json");
+    script.groups_save.lock().unwrap().push_back(save_path.clone());
+
+    click(&mut h, "Save groups...");
+    h.step();
+
+    assert!(save_path.exists(), "groups file was written");
+    let json = std::fs::read_to_string(&save_path).expect("read saved groups");
+
+    let video = item(&h, "talk.mp4");
+    let checked = h.state().editor().read_review(&json, video).expect("accepted by read_review");
+    let simplecut_core::Checked::Groups(g) = checked else { panic!("not groups") };
+    let s3 = g.groups[0].sentences.iter().find(|s| s.id == "3:0").expect("found 3:0 in saved file");
+    assert!((s_of(s3.start) - target_s).abs() < 1e-4);
+    assert!((s_of(s3.end) - target_e).abs() < 1e-4);
+}
+
+#[test]
+fn sentence_edge_coinciding_with_clip_edge_wins_over_clip_trim() {
+    if skip() {
+        return;
+    }
+    let (mut h, _) = ready(FakeService::default());
+
+    // Sentence 3:0 starts at 0.27s (or Tick(68_584_320_000))
+    let t_split = Tick::from_seconds_f64(0.27);
+    h.state_mut().perform(Action::SeekTimeline(t_split));
+    h.state_mut().perform(Action::Split);
+    h.step();
+
+    to_review(&mut h);
+
+    let (s0, _) = h.state().sentence_span_f64("3:0").unwrap();
+
+    // Untick 3:0 so it is Cut
+    h.state_mut().perform(Action::SetKeep { sentence: "3:0".into(), keep: false });
+    h.step();
+
+    // At s0 on the video lane, clip 1 starts AND sentence 3:0 starts.
+    // Dragging at this edge must drag the sentence edge, NOT trim the clip.
+    let rects = h.state().review_marker_rects();
+    assert!(!rects.is_empty());
+    let r3 = rects[0];
+    let edge_start = pos2(r3.left(), r3.center().y);
+    let initial_clip1_start = h.state().editor().sequence().unwrap().tracks[0].clips[1].start;
+
+    drag_mouse(&mut h, edge_start, edge_start + vec2(15.0, 0.0));
+
+    // Sentence 3:0 start was updated
+    let (s_new, _) = h.state().sentence_span_f64("3:0").unwrap();
+    assert!(s_new > s0, "sentence start changed: {s_new} > {s0}");
+
+    // Clip 1 start on the timeline was NOT trimmed
+    let seq = h.state().editor().sequence().unwrap();
+    let clip1 = &seq.tracks[0].clips[1];
+    assert_eq!(clip1.start, initial_clip1_start, "clip start was NOT trimmed");
+
+    // But clip trimming still works elsewhere:
+    // Drag the end of clip 1 (at 4.0s)
+    let clip1_rect = h.state().timeline_clip_rect(clip1.id).expect("clip rect");
+    let clip_end_pos = pos2(clip1_rect.right(), clip1_rect.center().y);
+    drag_mouse(&mut h, clip_end_pos, clip_end_pos - vec2(20.0, 0.0));
+
+    let seq_after = h.state().editor().sequence().unwrap();
+    let clip1_after = &seq_after.tracks[0].clips[1];
+    assert!(clip1_after.end() < clip1.end(), "clip trim still works where no sentence edge is");
 }

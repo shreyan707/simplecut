@@ -514,17 +514,31 @@ pub fn parse_advice(json: &str, groups: &[ReviewGroup]) -> Result<(Vec<Advice>, 
     Ok((advice, notes))
 }
 
-/// The groups as the AI button sends them (seconds, as in the contract).
-pub fn groups_to_json(job: &str, groups: &[ReviewGroup]) -> String {
+/// The groups formatted as a full version 2 "groups" document (seconds, as in the contract).
+pub fn groups_to_json(job: &str, media_path: &str, duration_seconds: f64, groups: &[ReviewGroup]) -> String {
     let secs = |t: Tick| t.0 as f64 / 254_016_000_000.0;
     let value = serde_json::json!({
+        "schema": SCHEMA_V2,
+        "stage": "groups",
         "job": job,
+        "media": {
+            "path": media_path,
+            "duration_seconds": duration_seconds,
+        },
         "groups": groups.iter().map(|g| serde_json::json!({
-            "id": g.id, "start": secs(g.start), "end": secs(g.end), "likely": g.likely,
-            "sentences": g.sentences.iter().map(|s| serde_json::json!({"id": s.id, "start": secs(s.start), "end": secs(s.end), "text": s.text})).collect::<Vec<_>>(),
+            "id": g.id,
+            "start": secs(g.start),
+            "end": secs(g.end),
+            "likely": g.likely,
+            "sentences": g.sentences.iter().map(|s| serde_json::json!({
+                "id": s.id,
+                "start": secs(s.start),
+                "end": secs(s.end),
+                "text": s.text,
+            })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });
-    value.to_string()
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
 }
 
 impl crate::editor::Editor {
@@ -753,12 +767,24 @@ mod tests {
     #[test]
     fn groups_are_sent_to_the_ai_in_seconds() {
         let Checked::Groups(g) = checked(GROUPS) else { panic!("not groups") };
-        let sent: serde_json::Value = serde_json::from_str(&groups_to_json("j_8f3a", &g.groups[..1])).unwrap();
+        let sent: serde_json::Value = serde_json::from_str(&groups_to_json("j_8f3a", "C:/videos/take1.mp4", 60.0, &g.groups[..1])).unwrap();
         assert_eq!(sent["job"], "j_8f3a");
         assert_eq!(sent["groups"][0]["id"], "span_0");
         assert_eq!(sent["groups"][0]["sentences"].as_array().unwrap().len(), 3);
         assert!((sent["groups"][0]["sentences"][2]["end"].as_f64().unwrap() - 14.6).abs() < 1e-9);
         assert!(sent["groups"][0]["sentences"][0].get("keep").is_none(), "the AI is not told what to keep");
+    }
+
+    #[test]
+    fn groups_to_json_produces_valid_v2_groups_document() {
+        let Checked::Groups(g) = checked(GROUPS) else { panic!("not groups") };
+        let json = groups_to_json(&g.job, "C:/videos/take1.mp4", 60.0, &g.groups);
+        let doc = parse_v2(&json).expect("valid json schema");
+        let validated = validate_v2(doc, ItemId(1), Tick::from_seconds_f64(60.0)).expect("valid groups doc");
+        let Checked::Groups(out) = validated else { panic!("not groups") };
+        assert_eq!(out.groups.len(), g.groups.len());
+        assert_eq!(out.groups[0].id, g.groups[0].id);
+        assert_eq!(out.groups[0].sentences.len(), g.groups[0].sentences.len());
     }
 
     #[test]

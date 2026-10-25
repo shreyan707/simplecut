@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use egui::{Color32, CornerRadius, RichText, WidgetInfo, WidgetType};
+use egui::{Color32, CornerRadius, RichText, WidgetInfo, WidgetType, vec2};
 use simplecut_core::retake::{CutProposal, CutScope, MAX_DOCUMENT_BYTES, Presence};
 use simplecut_core::review::parse_advice;
 use simplecut_core::{
@@ -92,6 +92,8 @@ pub(crate) struct Review {
     /// Sentence id -> (keep, who set it). A sentence not in the map is kept: nothing is cut until
     /// the user (or the AI, on request) chooses.
     pub keep: HashMap<String, (bool, Origin)>,
+    /// Sentence id -> original (start, end) on review open.
+    pub original: HashMap<String, (Tick, Tick)>,
     /// Sentences that have been on the timeline at some point.
     pub seen_on: HashSet<String>,
     pub rejected: Vec<(String, String)>,
@@ -124,13 +126,22 @@ pub(crate) enum Stage {
     Review(Review),
 }
 
-#[derive(Default)]
 pub(crate) struct RetakeUi {
     pub stage: Option<Stage>,
     /// The user agreed that sentences may be sent to the AI.
     pub ai_consented: bool,
     /// Where answers are logged before they are sent.
     pub label_log: Option<PathBuf>,
+    /// Where sentence span edits are logged before they are applied.
+    pub span_log: Option<PathBuf>,
+    /// Highlight strength of cut sentences on the timeline (0.1..=0.8).
+    pub highlight_strength: f32,
+}
+
+impl Default for RetakeUi {
+    fn default() -> Self {
+        Self { stage: None, ai_consented: false, label_log: None, span_log: None, highlight_strength: 0.45 }
+    }
 }
 
 impl RetakeUi {
@@ -158,12 +169,13 @@ pub(crate) enum MarkKind {
     Kept,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Mark {
     pub start: Tick,
     pub end: Tick,
     pub color: usize,
     pub kind: MarkKind,
+    pub sentence_id: Option<String>,
 }
 
 /// A group's place in the list: its label.
@@ -198,6 +210,20 @@ impl SimpleCutApp {
     /// Where the user's answers are logged before they are sent.
     pub fn set_label_log(&mut self, path: Option<PathBuf>) {
         self.retakes.label_log = path;
+    }
+
+    /// Where sentence span adjustments are logged before they are applied.
+    pub fn set_span_log(&mut self, path: Option<PathBuf>) {
+        self.retakes.span_log = path;
+    }
+
+    /// Highlight strength of cut sentences on the timeline (0.1..=0.8).
+    pub fn highlight_strength(&self) -> f32 {
+        self.retakes.highlight_strength
+    }
+
+    pub fn set_highlight_strength(&mut self, val: f32) {
+        self.retakes.highlight_strength = val.clamp(0.1, 0.8);
     }
 
     /// Which step the Retakes panel is on: "none", "analyzing", "questions", "resolving" or "review".
@@ -289,6 +315,57 @@ impl SimpleCutApp {
         }
     }
 
+    /// The media item of the review currently open.
+    pub fn review_item(&self) -> Option<ItemId> {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => Some(r.item),
+            _ => None,
+        }
+    }
+
+    /// Group (start, end) spans in media time ticks for the review currently open.
+    pub fn review_group_spans(&self) -> Vec<(Tick, Tick)> {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => r.groups.iter().map(|g| (g.start, g.end)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Sentence (start, end) span in media time ticks.
+    pub fn review_sentence_span(&self, sentence_id: &str) -> Option<(Tick, Tick)> {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => {
+                for g in &r.groups {
+                    if let Some(s) = g.sentences.iter().find(|s| s.id == sentence_id) {
+                        return Some((s.start, s.end));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Sentence (start, end) span in seconds.
+    pub fn sentence_span_f64(&self, sentence_id: &str) -> Option<(f64, f64)> {
+        self.review_sentence_span(sentence_id).map(|(s, e)| (s.0 as f64 / 254_016_000_000.0, e.0 as f64 / 254_016_000_000.0))
+    }
+
+    /// Whether a sentence's span has been changed from its original time.
+    pub fn is_sentence_span_edited(&self, sentence_id: &str) -> bool {
+        match &self.retakes.stage {
+            Some(Stage::Review(r)) => {
+                if let Some(orig) = r.original.get(sentence_id)
+                    && let Some(cur) = self.review_sentence_span(sentence_id)
+                {
+                    return (cur.0.0 - orig.0.0).abs() > 1000 || (cur.1.0 - orig.1.0).abs() > 1000;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn on(&self, item: ItemId, s: &Sentence) -> bool {
         self.editor.presence_of(item, s.start, s.end) == Presence::On
     }
@@ -313,12 +390,12 @@ impl SimpleCutApp {
             }
             let color = i % theme::GROUP_COLORS.len();
             for (s, e) in self.editor.timeline_ranges_of(r.item, g.start, g.end) {
-                out.push(Mark { start: s, end: e, color, kind: MarkKind::Band { likely: g.likely } });
+                out.push(Mark { start: s, end: e, color, kind: MarkKind::Band { likely: g.likely }, sentence_id: None });
             }
             for sent in g.sentences.iter().filter(|s| self.on(r.item, s)) {
                 let kind = if r.is_kept(&sent.id) { MarkKind::Kept } else { MarkKind::Cut };
                 for (s, e) in self.editor.timeline_ranges_of(r.item, sent.start, sent.end) {
-                    out.push(Mark { start: s, end: e, color, kind });
+                    out.push(Mark { start: s, end: e, color, kind, sentence_id: Some(sent.id.clone()) });
                 }
             }
         }
@@ -412,6 +489,9 @@ impl SimpleCutApp {
                     r.skip_unticked = skip;
                 }
             }
+            Action::SetSentenceSpan { sentence, start, end } => self.set_sentence_span(&sentence, start, end),
+            Action::ResetSentenceSpan(sentence) => self.reset_sentence_span(&sentence),
+            Action::SaveGroups => self.save_groups(),
             _ => {}
         }
     }
@@ -542,11 +622,18 @@ impl SimpleCutApp {
         let found = groups.len();
         let likely = groups.iter().filter(|g| g.likely).count();
         let ignored = rejected.len();
+        let mut original = HashMap::new();
+        for g in &groups {
+            for s in &g.sentences {
+                original.insert(s.id.clone(), (s.start, s.end));
+            }
+        }
         let mut r = Review {
             item,
             job,
             groups,
             keep: HashMap::new(),
+            original,
             seen_on: HashSet::new(),
             rejected: rejected.into_iter().map(|x| (x.id, x.reason)).collect(),
             from,
@@ -825,6 +912,61 @@ impl SimpleCutApp {
             Err(e) => self.fail_text(&e.to_string()),
         }
     }
+
+    fn set_sentence_span(&mut self, sentence: &str, start: f64, end: f64) {
+        let Some(Stage::Review(r)) = &mut self.retakes.stage else { return };
+        let Some(entry) = self.editor.media_entry(r.item) else { return };
+        let media_duration = entry.duration.0 as f64 / 254_016_000_000.0;
+        let Some(group) = r.groups.iter_mut().find(|g| g.sentences.iter().any(|s| s.id == sentence)) else { return };
+        let Some(sent) = group.sentences.iter().find(|s| s.id == sentence) else { return };
+        let old = (sent.start.0 as f64 / 254_016_000_000.0, sent.end.0 as f64 / 254_016_000_000.0);
+        if (old.0 - start).abs() < 1e-4 && (old.1 - end).abs() < 1e-4 {
+            return;
+        }
+        if let Some(path) = &self.retakes.span_log {
+            let _ = append_span_edit(path, &r.job, sentence, old, (start, end));
+        }
+        let _ = group.set_span(sentence, start, end, media_duration);
+    }
+
+    fn reset_sentence_span(&mut self, sentence: &str) {
+        let Some(Stage::Review(r)) = &mut self.retakes.stage else { return };
+        let Some(orig) = r.original.get(sentence).copied() else { return };
+        let Some(entry) = self.editor.media_entry(r.item) else { return };
+        let media_duration = entry.duration.0 as f64 / 254_016_000_000.0;
+        let Some(group) = r.groups.iter_mut().find(|g| g.sentences.iter().any(|s| s.id == sentence)) else { return };
+        let Some(sent) = group.sentences.iter().find(|s| s.id == sentence) else { return };
+        let old = (sent.start.0 as f64 / 254_016_000_000.0, sent.end.0 as f64 / 254_016_000_000.0);
+        let orig_sec = (orig.0.0 as f64 / 254_016_000_000.0, orig.1.0 as f64 / 254_016_000_000.0);
+        if let Some(path) = &self.retakes.span_log {
+            let _ = append_span_edit(path, &r.job, sentence, old, orig_sec);
+        }
+        if group.set_span(sentence, orig_sec.0, orig_sec.1, media_duration).is_ok() {
+            if let Some(sent) = group.sentences.iter_mut().find(|s| s.id == sentence) {
+                sent.start = orig.0;
+                sent.end = orig.1;
+            }
+            if let (Some(min_s), Some(max_e)) = (group.sentences.iter().map(|s| s.start).min(), group.sentences.iter().map(|s| s.end).max()) {
+                group.start = min_s;
+                group.end = max_e;
+            }
+        }
+    }
+
+    fn save_groups(&mut self) {
+        let Some(Stage::Review(r)) = &self.retakes.stage else { return };
+        let Some(entry) = self.editor.media_entry(r.item) else { return };
+        let suggested = if r.job.is_empty() { "groups.json".to_string() } else { format!("{}-groups.json", r.job) };
+        let Some(path) = self.dialogs.pick_groups_save_path(&suggested) else { return };
+        let duration_seconds = entry.duration.0 as f64 / 254_016_000_000.0;
+        let media_path = entry.path.as_deref().unwrap_or(&entry.name);
+        let json = simplecut_core::review::groups_to_json(&r.job, media_path, duration_seconds, &r.groups);
+        if let Err(e) = std::fs::write(&path, json) {
+            self.fail_text(&format!("Could not save groups to {}: {e}", path.display()));
+        } else {
+            self.info_text(format!("Saved groups to {}.", path.display()));
+        }
+    }
 }
 
 /// Add the user's answers to the local log, one JSON object per line, before they are sent.
@@ -848,6 +990,26 @@ fn append_labels(path: &Path, q: &Questions) -> std::io::Result<()> {
         let line = serde_json::json!({"time": now, "job": q.candidates.job, "pair": pair, "label": verdict, "source": "user", "a": side(&p.a), "b": side(&p.b), "score": p.score});
         writeln!(file, "{line}")?;
     }
+    Ok(())
+}
+
+/// Add a sentence span adjustment to the local log, one JSON object per line, before it is applied.
+fn append_span_edit(path: &Path, job: &str, sentence: &str, old: (f64, f64), new: (f64, f64)) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let line = serde_json::json!({
+        "time": now,
+        "job": job,
+        "sentence": sentence,
+        "old": { "start": old.0, "end": old.1 },
+        "new": { "start": new.0, "end": new.1 },
+        "source": "user",
+    });
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
     Ok(())
 }
 
@@ -1024,6 +1186,7 @@ struct SentenceRow {
     kept: bool,
     on: bool,
     origin: Option<Origin>,
+    edited: bool,
 }
 
 struct GroupView {
@@ -1057,7 +1220,13 @@ fn review_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
                 rows: g
                     .sentences
                     .iter()
-                    .map(|s| SentenceRow { sentence: s.clone(), kept: r.is_kept(&s.id), on: app.on(r.item, s), origin: r.origin(&s.id) })
+                    .map(|s| {
+                        let edited = match r.original.get(&s.id) {
+                            Some(orig) => (s.start.0 - orig.0.0).abs() > 1000 || (s.end.0 - orig.1.0).abs() > 1000,
+                            None => false,
+                        };
+                        SentenceRow { sentence: s.clone(), kept: r.is_kept(&s.id), on: app.on(r.item, s), origin: r.origin(&s.id), edited }
+                    })
                     .collect(),
                 reason: r.reasons.get(&g.id).cloned(),
                 seen_off: g.sentences.iter().any(|s| r.seen_on.contains(&s.id) && !app.on(r.item, s)),
@@ -1084,6 +1253,9 @@ fn review_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
         if can_redo && ui.small_button("Redo the questions").on_hover_text("Go back and change your answers").clicked() {
             app.queue(Action::RedoQuestions);
         }
+        if ui.small_button("Save groups...").on_hover_text("Save the groups document with edited spans").clicked() {
+            app.queue(Action::SaveGroups);
+        }
     });
 
     let mut skip_unticked = app.review_skips_unticked();
@@ -1096,6 +1268,14 @@ fn review_panel(app: &mut SimpleCutApp, ui: &mut egui::Ui, fps: f64) {
     {
         app.queue(Action::SetSkipUnticked(skip_unticked));
     }
+    let mut hs = app.highlight_strength();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Highlight strength").small().color(t.text_dim));
+        let r = ui.add(egui::Slider::new(&mut hs, 0.1..=0.8));
+        if r.changed() {
+            app.set_highlight_strength(hs);
+        }
+    });
     if pending {
         egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
             ui.label("The sentences of the groups you ask about will be sent to the AI service. Continue?");
@@ -1244,6 +1424,53 @@ fn group_card(app: &mut SimpleCutApp, ui: &mut egui::Ui, item: ItemId, g: &Group
                     go.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Go to {}", s.id)));
                     if go.clicked() {
                         app.queue(Action::GoToSentence(item, s.start));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut start_sec = s.start.0 as f64 / 254_016_000_000.0;
+                    let mut end_sec = s.end.0 as f64 / 254_016_000_000.0;
+
+                    let b_sm = ui.add(egui::Button::new("−").min_size(vec2(18.0, 0.0)));
+                    b_sm.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Nudge start of {} earlier", s.id)));
+                    if b_sm.clicked() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec - 0.05, end: end_sec });
+                    }
+                    let r_start = ui.add(egui::DragValue::new(&mut start_sec).speed(0.01).max_decimals(2).min_decimals(2).suffix(" s"));
+                    r_start.widget_info(|| WidgetInfo::labeled(WidgetType::DragValue, true, format!("Start of {}", s.id)));
+                    if r_start.changed() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec, end: end_sec });
+                    }
+                    let b_sp = ui.add(egui::Button::new("+").min_size(vec2(18.0, 0.0)));
+                    b_sp.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Nudge start of {} later", s.id)));
+                    if b_sp.clicked() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec + 0.05, end: end_sec });
+                    }
+
+                    ui.label(RichText::new("..").color(t.text_dim));
+
+                    let b_em = ui.add(egui::Button::new("−").min_size(vec2(18.0, 0.0)));
+                    b_em.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Nudge end of {} earlier", s.id)));
+                    if b_em.clicked() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec, end: end_sec - 0.05 });
+                    }
+                    let r_end = ui.add(egui::DragValue::new(&mut end_sec).speed(0.01).max_decimals(2).min_decimals(2).suffix(" s"));
+                    r_end.widget_info(|| WidgetInfo::labeled(WidgetType::DragValue, true, format!("End of {}", s.id)));
+                    if r_end.changed() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec, end: end_sec });
+                    }
+                    let b_ep = ui.add(egui::Button::new("+").min_size(vec2(18.0, 0.0)));
+                    b_ep.widget_info(|| WidgetInfo::labeled(WidgetType::Button, row.on, format!("Nudge end of {} later", s.id)));
+                    if b_ep.clicked() {
+                        app.queue(Action::SetSentenceSpan { sentence: s.id.clone(), start: start_sec, end: end_sec + 0.05 });
+                    }
+
+                    if row.edited {
+                        ui.label(RichText::new("edited").color(t.accent).small().strong());
+                        let reset_btn = ui.small_button("Reset span");
+                        reset_btn.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Reset span of {}", s.id)));
+                        if reset_btn.clicked() {
+                            app.queue(Action::ResetSentenceSpan(s.id.clone()));
+                        }
                     }
                 });
             });

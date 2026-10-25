@@ -52,6 +52,15 @@ impl Dialogs for NativeDialogs {
         rfd::FileDialog::new().set_title("Open retake analysis").add_filter("Retake analysis", &["json"]).pick_file()
     }
 
+    fn pick_groups_save_path(&self, suggested_name: &str) -> Option<PathBuf> {
+        let mut path =
+            rfd::FileDialog::new().set_title("Save retake groups").add_filter("Retake groups", &["json"]).set_file_name(suggested_name).save_file()?;
+        if path.extension().is_none() {
+            path.set_extension("json");
+        }
+        Some(path)
+    }
+
     fn open_folder(&self, path: &std::path::Path) {
         #[cfg(target_os = "windows")]
         {

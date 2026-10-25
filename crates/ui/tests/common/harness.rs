@@ -21,6 +21,7 @@ pub struct Script {
     pub export: Arc<Mutex<VecDeque<PathBuf>>>,
     pub analysis: Arc<Mutex<VecDeque<PathBuf>>>,
     pub relink: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub groups_save: Arc<Mutex<VecDeque<PathBuf>>>,
     pub opened_folders: Arc<Mutex<Vec<PathBuf>>>,
 }
 
@@ -39,6 +40,10 @@ impl Dialogs for Script {
 
     fn pick_analysis_file(&self) -> Option<PathBuf> {
         self.analysis.lock().unwrap().pop_front()
+    }
+
+    fn pick_groups_save_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        self.groups_save.lock().unwrap().pop_front()
     }
 
     fn pick_export_path(&self, _suggested_name: &str) -> Option<PathBuf> {

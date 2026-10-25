@@ -39,6 +39,7 @@ fn main() -> eframe::Result {
                 .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SimpleCut")))
                 .unwrap_or_else(|| PathBuf::from(".simplecut"));
             app.set_label_log(Some(data_dir.join("labels.jsonl")));
+            app.set_span_log(Some(data_dir.join("span_edits.jsonl")));
             app.enable_autosave(data_dir);
             // a stand-in service so the whole retake flow can be tried before a real one exists
             if std::env::var_os("SIMPLECUT_FAKE_RETAKES").is_some() {

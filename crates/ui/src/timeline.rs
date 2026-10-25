@@ -7,12 +7,12 @@
 //! A dragged clip snaps to the playhead and to other clips and can never land on top of another
 //! clip. Nothing is changed until the mouse is released, so one drag is one undo step.
 
-use egui::{Align2, Color32, CornerRadius, CursorIcon, FontId, Rect, Sense, Shape, Stroke, StrokeKind, UiBuilder, WidgetInfo, WidgetType, pos2, vec2};
+use egui::{Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, UiBuilder, WidgetInfo, WidgetType, pos2, vec2};
 use simplecut_core::{ClipId, ClipView, Edge, SequenceView, Tick, TrackId, TrackKind};
 
 use crate::app::{Action, SimpleCutApp};
 use crate::format;
-use crate::retakes::MarkKind;
+use crate::retakes::{Mark, MarkKind};
 use crate::theme;
 use crate::tl_math::{self, Axis, ClipGeom, Hit};
 
@@ -41,6 +41,10 @@ enum Drag {
         orig: Tick,
         to: Tick,
         regular: bool,
+    },
+    SentenceEdge {
+        sentence: String,
+        edge: Edge,
     },
 }
 
@@ -134,9 +138,10 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
         }
     }
     let ruler = Rect::from_min_max(lanes_rect.left_top(), pos2(lanes_rect.right(), outer.top() + RULER_H));
-    app.tl.last = Some(Geometry { axis, lane_w, ruler, lanes: lanes.clone(), clips: clips.clone() });
+    let geom = Geometry { axis, lane_w, ruler, lanes: lanes.clone(), clips: clips.clone() };
+    app.tl.last = Some(geom.clone());
 
-    interact(app, ui, &resp, &seq, &axis, &clips, ruler);
+    interact(app, ui, &resp, &seq, &geom);
 
     // ── paint ──
     let painter = ui.painter_at(lanes_rect.expand2(vec2(0.0, 2.0)));
@@ -404,40 +409,77 @@ fn group_of(seq: &SequenceView, clip: ClipId) -> Vec<(usize, ClipView)> {
     out
 }
 
-fn interact(app: &mut SimpleCutApp, ui: &egui::Ui, resp: &egui::Response, seq: &SequenceView, axis: &Axis, clips: &[ClipGeom], ruler: Rect) {
+fn hit_sentence_edge(marks: &[Mark], top_lane: Rect, axis: &Axis, p: Pos2, edge_px: f32) -> Option<(String, Edge)> {
+    if p.y < top_lane.top() - 2.0 || p.y > top_lane.bottom() + 2.0 {
+        return None;
+    }
+    let mut best: Option<(f32, String, Edge)> = None;
+    for m in marks {
+        let Some(ref sid) = m.sentence_id else { continue };
+        if m.kind != MarkKind::Cut && m.kind != MarkKind::Kept {
+            continue;
+        }
+        let x_start = axis.x_of(m.start);
+        let x_end = axis.x_of(m.end);
+        let d_start = (p.x - x_start).abs();
+        let d_end = (p.x - x_end).abs();
+        if d_start <= edge_px && best.as_ref().is_none_or(|(d, ..)| d_start < *d) {
+            best = Some((d_start, sid.clone(), Edge::Start));
+        }
+        if d_end <= edge_px && best.as_ref().is_none_or(|(d, ..)| d_end < *d) {
+            best = Some((d_end, sid.clone(), Edge::End));
+        }
+    }
+    best.map(|(_, sid, edge)| (sid, edge))
+}
+
+fn interact(app: &mut SimpleCutApp, ui: &egui::Ui, resp: &egui::Response, seq: &SequenceView, geom: &Geometry) {
+    let (axis, clips, ruler, lanes) = (&geom.axis, &geom.clips, geom.ruler, &geom.lanes);
     let mods = ui.input(|i| i.modifiers);
     if app.tl.drag.is_none() {
-        let hover = resp.hover_pos().filter(|p| !ruler.contains(*p)).map_or(Hit::Empty, |p| tl_math::hit(clips, p, EDGE_PX));
-        match hover {
-            Hit::Edge(..) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
-            Hit::Body(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
-            Hit::Empty => {}
+        let sentence_hover = lanes
+            .first()
+            .and_then(|tl| resp.hover_pos().filter(|p| !ruler.contains(*p)).and_then(|p| hit_sentence_edge(&app.review_marks(), *tl, axis, p, 5.0)));
+        if sentence_hover.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        } else {
+            let hover = resp.hover_pos().filter(|p| !ruler.contains(*p)).map_or(Hit::Empty, |p| tl_math::hit(clips, p, EDGE_PX));
+            match hover {
+                Hit::Edge(..) => ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal),
+                Hit::Body(_) => ui.ctx().set_cursor_icon(CursorIcon::Grab),
+                Hit::Empty => {}
+            }
         }
     }
 
     if resp.drag_started() {
         let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
         if let Some(p) = origin {
-            let h = if ruler.contains(p) { Hit::Empty } else { tl_math::hit(clips, p, EDGE_PX) };
-            app.tl.drag = Some(match h {
-                Hit::Edge(id, edge) => match seq.clip(id) {
-                    Some(c) => {
-                        let orig = if edge == Edge::Start { c.start } else { c.end() };
-                        Drag::Trim { clip: id, edge, orig, to: orig, regular: mods.alt }
-                    }
-                    None => Drag::Scrub,
-                },
-                Hit::Body(id) => match seq.clip(id) {
-                    Some(c) => {
-                        if !c.selected {
-                            app.queue(Action::SelectClips { clips: vec![id], add: false });
+            let sentence_hit = if ruler.contains(p) { None } else { lanes.first().and_then(|tl| hit_sentence_edge(&app.review_marks(), *tl, axis, p, 5.0)) };
+            if let Some((sentence, edge)) = sentence_hit {
+                app.tl.drag = Some(Drag::SentenceEdge { sentence, edge });
+            } else {
+                let h = if ruler.contains(p) { Hit::Empty } else { tl_math::hit(clips, p, EDGE_PX) };
+                app.tl.drag = Some(match h {
+                    Hit::Edge(id, edge) => match seq.clip(id) {
+                        Some(c) => {
+                            let orig = if edge == Edge::Start { c.start } else { c.end() };
+                            Drag::Trim { clip: id, edge, orig, to: orig, regular: mods.alt }
                         }
-                        Drag::Move { clip: id, orig: c.start, grab: Tick(axis.time_at(p.x).0 - c.start.0), to: c.start }
-                    }
-                    None => Drag::Scrub,
-                },
-                Hit::Empty => Drag::Scrub,
-            });
+                        None => Drag::Scrub,
+                    },
+                    Hit::Body(id) => match seq.clip(id) {
+                        Some(c) => {
+                            if !c.selected {
+                                app.queue(Action::SelectClips { clips: vec![id], add: false });
+                            }
+                            Drag::Move { clip: id, orig: c.start, grab: Tick(axis.time_at(p.x).0 - c.start.0), to: c.start }
+                        }
+                        None => Drag::Scrub,
+                    },
+                    Hit::Empty => Drag::Scrub,
+                });
+            }
         }
     }
 
@@ -495,6 +537,29 @@ fn interact(app: &mut SimpleCutApp, ui: &egui::Ui, resp: &egui::Response, seq: &
                 }
                 None => Drag::Scrub,
             },
+            Drag::SentenceEdge { sentence, edge } => {
+                if let Some(item) = app.review_item() {
+                    let t = axis.time_at(p.x);
+                    if let Some(file_t) = app.editor.file_time_at(item, t) {
+                        let new_sec = file_t.0 as f64 / 254_016_000_000.0;
+                        if let Some((cur_start, cur_end)) = app.sentence_span_f64(&sentence) {
+                            let (s, e) = match edge {
+                                Edge::Start => (new_sec, cur_end),
+                                Edge::End => (cur_start, new_sec),
+                            };
+                            let changed = match edge {
+                                Edge::Start => (new_sec - cur_start).abs() > 1e-4,
+                                Edge::End => (new_sec - cur_end).abs() > 1e-4,
+                            };
+                            if changed {
+                                app.queue(Action::SetSentenceSpan { sentence: sentence.clone(), start: s, end: e });
+                            }
+                        }
+                        resp.show_tooltip_text(format!("{:.2} s", new_sec));
+                    }
+                }
+                Drag::SentenceEdge { sentence, edge }
+            }
         };
         app.tl.drag = Some(next);
     }
@@ -545,7 +610,7 @@ fn paint_review(app: &SimpleCutApp, painter: &egui::Painter, axis: &Axis, lanes:
                 painter.rect_filled(r, radius, color.gamma_multiply(if likely { 0.22 } else { 0.1 }));
             }
             MarkKind::Cut => {
-                painter.rect_filled(r, radius, color.gamma_multiply(0.55));
+                painter.rect_filled(r, radius, color.gamma_multiply(app.highlight_strength()));
                 painter.rect_stroke(r, radius, Stroke::new(2.0, color), StrokeKind::Inside);
             }
             MarkKind::Kept => {

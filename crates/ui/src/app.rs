@@ -123,6 +123,16 @@ pub enum Action {
     ApplyRetakes,
     CloseReview,
     SetSkipUnticked(bool),
+    /// Set the media-clock span of a sentence in seconds.
+    SetSentenceSpan {
+        sentence: String,
+        start: f64,
+        end: f64,
+    },
+    /// Reset the span of a sentence to its original time.
+    ResetSentenceSpan(String),
+    /// Save the current groups to a JSON file.
+    SaveGroups,
 }
 
 /// A line of feedback under the work area.
@@ -403,7 +413,10 @@ impl SimpleCutApp {
             | Action::PlaySentence(..)
             | Action::ApplyRetakes
             | Action::CloseReview
-            | Action::SetSkipUnticked(_) => self.perform_retake(action),
+            | Action::SetSkipUnticked(_)
+            | Action::SetSentenceSpan { .. }
+            | Action::ResetSentenceSpan(_)
+            | Action::SaveGroups => self.perform_retake(action),
             Action::NewProject => self.guard_unsaved(Then::New),
             Action::OpenProject => {
                 if let Some(path) = self.dialogs.pick_project_to_open() {

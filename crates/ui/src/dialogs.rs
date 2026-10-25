@@ -16,6 +16,10 @@ pub trait Dialogs {
     fn pick_relink_path(&self, suggested_name: &str) -> Option<PathBuf>;
     /// Choose a retake analysis file (JSON, see docs/retake-contract.md).
     fn pick_analysis_file(&self) -> Option<PathBuf>;
+    /// Choose where to save a retake groups document; `suggested_name` is a file name to offer.
+    fn pick_groups_save_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        None
+    }
     /// Open the system file browser showing the given file/folder.
     fn open_folder(&self, path: &std::path::Path);
 }
