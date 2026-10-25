@@ -111,6 +111,7 @@ pub enum Action {
     },
     KeepLastOnly(String),
     KeepAllOf(String),
+    RemoveAllOf(String),
     KeepLastInLikely,
     AskAi,
     ConfirmAi,
@@ -387,6 +388,7 @@ impl SimpleCutApp {
             | Action::SetKeep { .. }
             | Action::KeepLastOnly(_)
             | Action::KeepAllOf(_)
+            | Action::RemoveAllOf(_)
             | Action::KeepLastInLikely
             | Action::AskAi
             | Action::ConfirmAi

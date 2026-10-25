@@ -323,3 +323,77 @@ fn groups_groups_proposals_by_key_ordered_by_start_with_color_modulo_and_offset(
         assert_eq!(groups(&analysis), grps);
     }
 }
+
+#[test]
+fn a_group_removed_completely_and_two_adjacent_groups_removed_completely_are_one_undo_step() {
+    let Some((mut e, item)) = project() else { return };
+
+    // 1. A group removed completely:
+    // Group "g1" spans 2.0 to 4.0 with two sentences: 2.0..3.0 and 3.0..4.0
+    let mut p1 = proposal("p1", 2.0, 3.0);
+    p1.group = Some("g1".into());
+    let mut p2 = proposal("p2", 3.0, 4.0);
+    p2.group = Some("g1".into());
+
+    let steps = e.session().history.undo.len();
+    let r = e.apply_cuts(item, &[p1, p2], CutScope::MainTracks).unwrap();
+    assert_eq!(r.cuts, 1, "contiguous sentences of one group merge into one cut");
+    assert!((s_of(r.removed) - 2.0).abs() < 0.04);
+    assert_valid(&e);
+
+    // Remaining clips on Video track: 0.0..2.0 (source 0.0) and 2.0..8.0 (source 4.0)
+    let v = e.sequence().unwrap();
+    let video = track(&v, "Video");
+    assert_eq!(video.clips.len(), 2);
+    assert!((s_of(video.clips[0].start) - 0.0).abs() < 0.04);
+    assert!((s_of(video.clips[0].duration) - 2.0).abs() < 0.04);
+    assert!((s_of(video.clips[0].source_in) - 0.0).abs() < 0.04);
+
+    assert!((s_of(video.clips[1].start) - 2.0).abs() < 0.04);
+    assert!((s_of(video.clips[1].duration) - 6.0).abs() < 0.04);
+    assert!((s_of(video.clips[1].source_in) - 4.0).abs() < 0.04);
+
+    // One undo step brings it back
+    assert_eq!(e.session().history.undo.len(), steps + 1);
+    e.undo().unwrap();
+    assert_eq!(e.sequence().unwrap().tracks[0].clips.len(), 1);
+    assert!((s_of(e.sequence().unwrap().duration) - 10.0).abs() < 0.05);
+
+    // 2. Two adjacent groups removed completely:
+    // Group "g1" (2.0..4.0) and Group "g2" (4.0..6.0) touch at 4.0
+    let mut g1_a = proposal("g1_a", 2.0, 3.0);
+    g1_a.group = Some("g1".into());
+    let mut g1_b = proposal("g1_b", 3.0, 4.0);
+    g1_b.group = Some("g1".into());
+
+    let mut g2_a = proposal("g2_a", 4.0, 5.0);
+    g2_a.group = Some("g2".into());
+    let mut g2_b = proposal("g2_b", 5.0, 6.0);
+    g2_b.group = Some("g2".into());
+
+    let steps2 = e.session().history.undo.len();
+    let r2 = e.apply_cuts(item, &[g1_a, g1_b, g2_a, g2_b], CutScope::MainTracks).unwrap();
+    // They merge into one contiguous cut of 4 seconds (2.0 to 6.0)
+    assert_eq!(r2.cuts, 1);
+    assert!((s_of(r2.removed) - 4.0).abs() < 0.04);
+    assert_valid(&e);
+
+    let v2 = e.sequence().unwrap();
+    let video2 = track(&v2, "Video");
+    assert_eq!(video2.clips.len(), 2);
+    // Clip 1: 0.0..2.0 (source_in 0.0)
+    assert!((s_of(video2.clips[0].start) - 0.0).abs() < 0.04);
+    assert!((s_of(video2.clips[0].duration) - 2.0).abs() < 0.04);
+    assert!((s_of(video2.clips[0].source_in) - 0.0).abs() < 0.04);
+
+    // Clip 2: 2.0..6.0 (duration 4.0, source_in 6.0)
+    assert!((s_of(video2.clips[1].start) - 2.0).abs() < 0.04);
+    assert!((s_of(video2.clips[1].duration) - 4.0).abs() < 0.04);
+    assert!((s_of(video2.clips[1].source_in) - 6.0).abs() < 0.04);
+
+    // One undo step brings it back
+    assert_eq!(e.session().history.undo.len(), steps2 + 1);
+    e.undo().unwrap();
+    assert_eq!(e.sequence().unwrap().tracks[0].clips.len(), 1);
+    assert!((s_of(e.sequence().unwrap().duration) - 10.0).abs() < 0.05);
+}

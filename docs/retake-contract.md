@@ -52,7 +52,7 @@ expanded. No pairs, no keeper, no notes, no scores.
 
 ## In the editor
 
-Every sentence has a keep tick; all start kept, so nothing is cut until the user chooses. At least
-one take of each group must stay kept. A group with fewer than two sentences left on the timeline
-is shown as "already handled" (Undo brings it back). Files made by hand can be opened with
-Ctrl+Shift+R (candidates or groups). The old `/1` format is no longer read.
+Every sentence has a keep tick; all start kept, so nothing is cut until the user chooses.
+A group with fewer than two sentences left on the timeline is shown as "already handled" (Undo
+brings it back). Files made by hand can be opened with Ctrl+Shift+R (candidates or groups).
+The old `/1` format is no longer read.

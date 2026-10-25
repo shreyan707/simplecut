@@ -166,11 +166,28 @@ fn at_least_one_sentence_of_a_group_stays_and_the_helpers_work() {
     assert_eq!(h.state().review_kept(&ids[2]), Some(true));
     assert_eq!(h.state().review_cut_count(), 2);
 
-    // the last one cannot be unticked
+    // unticking the last sentence now works, cutting the whole group
     h.state_mut().perform(Action::SetKeep { sentence: ids[2].clone(), keep: false });
     h.step();
-    assert_eq!(h.state().review_kept(&ids[2]), Some(true));
-    assert!(h.state().banner().is_some_and(|b| b.error && b.text.contains("at least one")), "{:?}", h.state().banner());
+    assert_eq!(h.state().review_kept(&ids[2]), Some(false));
+    assert_eq!(h.state().review_cut_count(), ids.len());
+    assert!(!h.state().banner().is_some_and(|b| b.error));
+
+    // remove all helper works directly
+    h.state_mut().perform(Action::KeepAllOf(gid.clone()));
+    h.step();
+    assert_eq!(h.state().review_cut_count(), 0);
+    h.state_mut().perform(Action::RemoveAllOf(gid.clone()));
+    h.step();
+    assert_eq!(h.state().review_cut_count(), ids.len());
+    assert_eq!(h.state().review_kept(&ids[0]), Some(false));
+    assert_eq!(h.state().review_kept(&ids[1]), Some(false));
+    assert_eq!(h.state().review_kept(&ids[2]), Some(false));
+
+    // buttons exist
+    h.get_by_label("Remove all in Retake 1");
+    h.get_by_label("Keep all in Retake 1");
+    h.get_by_label("Keep last only in Retake 1");
 
     // keep all undoes the choice
     h.state_mut().perform(Action::KeepAllOf(gid));

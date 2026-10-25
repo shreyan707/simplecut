@@ -370,6 +370,7 @@ impl SimpleCutApp {
             Action::SetKeep { sentence, keep } => self.set_keep(&sentence, keep),
             Action::KeepLastOnly(group) => self.keep_last(&group),
             Action::KeepAllOf(group) => self.keep_all(&group),
+            Action::RemoveAllOf(group) => self.remove_all(&group),
             Action::KeepLastInLikely => {
                 let ids: Vec<String> = match &self.retakes.stage {
                     Some(Stage::Review(r)) => r.groups.iter().filter(|g| g.likely && self.actionable(r.item, g)).map(|g| g.id.clone()).collect(),
@@ -700,13 +701,17 @@ impl SimpleCutApp {
 
     fn set_keep(&mut self, sentence: &str, keep: bool) {
         let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
-        if let Some(g) = r.groups.iter().find(|g| g.sentences.iter().any(|s| s.id == sentence)) {
-            // how many sentences of the group would stay kept on the timeline after this change
-            let stay = g.sentences.iter().filter(|s| self.on(r.item, s)).filter(|s| if s.id == sentence { keep } else { r.is_kept(&s.id) }).count();
-            if stay == 0 {
-                self.fail_text("Keep at least one take of each line. If this is not a retake, press “Keep all”.");
-            } else {
-                r.keep.insert(sentence.to_string(), (keep, Origin::User));
+        r.keep.insert(sentence.to_string(), (keep, Origin::User));
+        self.retakes.stage = Some(Stage::Review(r));
+    }
+
+    fn remove_all(&mut self, group: &str) {
+        let Some(Stage::Review(mut r)) = self.retakes.stage.take() else { return };
+        if let Some(g) = r.groups.iter().find(|g| g.id == group) {
+            for s in &g.sentences {
+                if self.on(r.item, s) {
+                    r.keep.insert(s.id.clone(), (false, Origin::User));
+                }
             }
         }
         self.retakes.stage = Some(Stage::Review(r));
@@ -1154,18 +1159,28 @@ fn group_card(app: &mut SimpleCutApp, ui: &mut egui::Ui, item: ItemId, g: &Group
     let t = theme::tokens();
     let color = colour_of(g.color_index);
     let on_rows = g.rows.iter().filter(|r| r.on).count();
+    let any_kept = g.rows.iter().any(|r| r.on && r.kept);
     let ai = g.rows.iter().any(|r| r.origin == Some(Origin::Ai));
-    let title = RichText::new(format!(
-        "●  {}  ·  {} sentences  ·  {} – {}{}",
-        g.label,
-        on_rows,
-        format::timecode(g.start, fps),
-        format::timecode(g.end, fps),
-        if ai { "  ·  AI" } else { "" }
-    ))
-    .color(color)
-    .strong();
-    let res = egui::CollapsingHeader::new(title).id_salt(("retake-group", &g.id)).default_open(open).show(ui, |ui| {
+
+    let id = ui.make_persistent_id(("retake-group", &g.id));
+    let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, open);
+    let res = state.show_header(ui, |ui| {
+        ui.horizontal(|ui| {
+            let title = format!(
+                "●  {}  ·  {} sentences  ·  {} – {}{}",
+                g.label,
+                on_rows,
+                format::timecode(g.start, fps),
+                format::timecode(g.end, fps),
+                if ai { "  ·  AI" } else { "" }
+            );
+            ui.label(RichText::new(title).color(color).strong());
+            if !any_kept && on_rows > 0 {
+                ui.label(RichText::new("all removed").color(t.danger).small().strong());
+            }
+        });
+    });
+    let (toggle_btn, _, _) = res.body(|ui| {
         if let Some(reason) = &g.reason {
             ui.label(RichText::new(format!("AI: {reason}")).color(t.text_dim).small());
         }
@@ -1217,8 +1232,13 @@ fn group_card(app: &mut SimpleCutApp, ui: &mut egui::Ui, item: ItemId, g: &Group
             if all.clicked() {
                 app.queue(Action::KeepAllOf(g.id.clone()));
             }
+            let remove_all = ui.small_button("Remove all");
+            remove_all.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Remove all in {}", g.label)));
+            if remove_all.clicked() {
+                app.queue(Action::RemoveAllOf(g.id.clone()));
+            }
         });
     });
-    res.header_response.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("Group {}", g.label)));
+    toggle_btn.widget_info(|| WidgetInfo::labeled(WidgetType::CollapsingHeader, true, format!("Group {}", g.label)));
     ui.add_space(4.0);
 }
