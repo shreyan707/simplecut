@@ -26,10 +26,10 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
     if media.is_empty() {
         ui.add_space(24.0);
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("No media yet").color(t.text).size(16.0));
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new("Drop video or audio files here,\nor use Import.").color(t.text_dim));
-            ui.add_space(12.0);
+            ui.label(egui::RichText::new("No media yet").color(t.text).size(16.0).strong());
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Drag and drop video or audio files here,\nor click Import media to get started.").color(t.text_dim));
+            ui.add_space(14.0);
             if ui.button("Import media…").clicked() {
                 app.queue(Action::Import);
             }
@@ -98,15 +98,23 @@ fn row(app: &mut SimpleCutApp, ui: &mut egui::Ui, m: &MediaEntry) {
     if resp.clicked() {
         app.queue(Action::PreviewMedia(m.id));
     }
-    if resp.double_clicked() && !m.offline {
-        app.queue(Action::AddToTimeline(m.id, lane));
+    if resp.double_clicked() {
+        if m.offline {
+            app.queue(Action::RelinkMedia(m.id));
+        } else {
+            app.queue(Action::AddToTimeline(m.id, lane));
+        }
     }
     resp.context_menu(|ui| {
-        if m.video.is_some() && ui.button("Add to timeline").clicked() {
+        if m.offline && ui.button("Relink media…").clicked() {
+            app.queue(Action::RelinkMedia(m.id));
+            ui.close();
+        }
+        if !m.offline && m.video.is_some() && ui.button("Add to timeline").clicked() {
             app.queue(Action::AddToTimeline(m.id, Lane::Main));
             ui.close();
         }
-        if m.audio.is_some() && ui.button("Add as music").clicked() {
+        if !m.offline && m.audio.is_some() && ui.button("Add as music").clicked() {
             app.queue(Action::AddToTimeline(m.id, Lane::Music));
             ui.close();
         }

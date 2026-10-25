@@ -132,7 +132,17 @@ impl ExportJob {
 
 /// Verify an exported media file by importing it into a scratch engine session.
 /// Checks that the file has a video stream, audio stream, matching dimensions, and duration within one frame.
-pub fn verify_export(path: &Path, expected_duration: Tick, _expected_fps: f64, expected_width: u32, expected_height: u32) -> Result<MediaEntry> {
+pub fn verify_export(path: &Path, expected_duration: Tick, expected_fps: f64, expected_width: u32, expected_height: u32) -> Result<MediaEntry> {
+    let path_buf = path.to_path_buf();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        verify_export_inner(&path_buf, expected_duration, expected_fps, expected_width, expected_height)
+    })) {
+        Ok(res) => res,
+        Err(_) => Err(EditorError::Engine("Verification panicked unexpectedly".into())),
+    }
+}
+
+fn verify_export_inner(path: &Path, expected_duration: Tick, _expected_fps: f64, expected_width: u32, expected_height: u32) -> Result<MediaEntry> {
     if !path.exists() {
         return Err(EditorError::FileMissing(format!("Exported file does not exist: {}", path.to_string_lossy())));
     }

@@ -154,6 +154,49 @@ impl Editor {
         self.session.path.as_deref()
     }
 
+    // ── persistence & recovery ─────────────────────────────────────────────
+
+    /// Start auto-save and the crash-recovery journal using `data_dir`.
+    pub fn enable_autosave(&mut self, data_dir: PathBuf) -> Result<()> {
+        let cfg = filmcraft_engine::autosave::AutosaveConfig::new(data_dir);
+        self.session.start_autosave(cfg).map_err(|e| EditorError::Engine(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Clean shutdown: flush and stop the persistence worker.
+    pub fn shutdown(&mut self) {
+        self.session.shutdown();
+    }
+
+    /// List any recovery candidates left by dead sessions.
+    pub fn recovery_candidates(&self) -> &[filmcraft_engine::autosave::RecoveryCandidate] {
+        self.session.recovery_candidates()
+    }
+
+    /// Recover unsaved changes from a candidate session (or the newest if `id` is None).
+    pub fn recover(&mut self, id: Option<&str>) -> Result<()> {
+        self.session.execute(
+            "file.recover",
+            match id {
+                Some(id) => json!({ "id": id }),
+                None => json!({}),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Discard unsaved changes from a candidate session (or all if `id` is None).
+    pub fn discard_recovery(&mut self, id: Option<&str>) -> Result<()> {
+        self.session.execute(
+            "file.discardRecovery",
+            match id {
+                Some(id) => json!({ "id": id }),
+                None => json!({ "all": true }),
+            },
+        )?;
+        Ok(())
+    }
+
     // ── media ──────────────────────────────────────────────────────────────
 
     /// Import video and audio files. Succeeds when at least one file was imported; the others are
@@ -199,6 +242,38 @@ impl Editor {
 
     pub fn media_entry(&self, id: ItemId) -> Option<MediaEntry> {
         self.session.project.item(id).and_then(|it| self.media_entry_of(it))
+    }
+
+    /// Relink an offline media item to a new file path.
+    pub fn relink(&mut self, item: ItemId, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(EditorError::FileMissing(format!("Relink destination does not exist: {}", path.to_string_lossy())));
+        }
+        self.session.execute(
+            "media.relink",
+            json!({
+                "item": item.0,
+                "path": path.to_string_lossy(),
+                "match": { "fileName": false },
+                "force": false,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Automatically relink missing media by searching a directory tree.
+    pub fn auto_relink(&mut self, folder: &Path) -> Result<usize> {
+        if !folder.exists() {
+            return Err(EditorError::FileMissing(format!("Folder does not exist: {}", folder.to_string_lossy())));
+        }
+        let res = self.session.execute(
+            "media.autoRelink",
+            json!({
+                "folder": folder.to_string_lossy(),
+            }),
+        )?;
+        let count = res.get("relinked").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        Ok(count)
     }
 
     fn media_entry_of(&self, it: &ProjectItem) -> Option<MediaEntry> {

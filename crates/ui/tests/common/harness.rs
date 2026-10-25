@@ -19,6 +19,7 @@ pub struct Script {
     pub open: Arc<Mutex<VecDeque<PathBuf>>>,
     pub save: Arc<Mutex<VecDeque<PathBuf>>>,
     pub export: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub relink: Arc<Mutex<VecDeque<PathBuf>>>,
     pub opened_folders: Arc<Mutex<Vec<PathBuf>>>,
 }
 
@@ -37,6 +38,10 @@ impl Dialogs for Script {
 
     fn pick_export_path(&self, _suggested_name: &str) -> Option<PathBuf> {
         self.export.lock().unwrap().pop_front()
+    }
+
+    fn pick_relink_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        self.relink.lock().unwrap().pop_front()
     }
 
     fn open_folder(&self, path: &std::path::Path) {

@@ -36,6 +36,8 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
         button(app, ui, "Delete", "Delete the selected clips and close the gap (Delete)", Action::Delete, has_selection);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            button(app, ui, "Shortcuts", "View keyboard shortcuts (F1)", Action::OpenShortcuts, true);
+            ui.separator();
             button(app, ui, "Export", export_tip, Action::OpenExportDialog, can_export);
             ui.add_space(8.0);
             let dirty = app.editor.is_dirty();

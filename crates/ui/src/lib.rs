@@ -15,5 +15,5 @@ mod timeline;
 mod tl_math;
 mod toolbar;
 
-pub use app::{Action, Banner, SimpleCutApp, Source};
+pub use app::{Action, Banner, SimpleCutApp, Source, write_crash_log};
 pub use dialogs::{Dialogs, NoDialogs};

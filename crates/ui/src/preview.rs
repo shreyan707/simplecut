@@ -79,6 +79,9 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if m.offline {
                 ui.label(egui::RichText::new(m.offline_reason.clone().unwrap_or_else(|| "This file is offline.".into())).color(t.danger));
+                if ui.button("Relink media…").clicked() {
+                    app.queue(Action::RelinkMedia(m.id));
+                }
             }
             if !m.offline && m.video.is_some() && ui.button("Add to timeline").on_hover_text("Put this at the end of the video track").clicked() {
                 app.queue(Action::AddToTimeline(m.id, Lane::Main));

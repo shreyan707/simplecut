@@ -22,6 +22,7 @@ pub use snapshot::{PreviewFrame, Snapshot, Target};
 pub use thumbnails::Thumbnails;
 pub use view::{ClipView, ImportReport, MediaEntry, SequenceView, TrackView};
 
+pub use filmcraft_engine::autosave::RecoveryCandidate;
 pub use filmcraft_media::MediaKind;
 pub use filmcraft_project::{ClipId, TrackId, TrackKind};
 pub use filmcraft_time::{FrameRate, Tick};

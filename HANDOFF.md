@@ -123,11 +123,11 @@ Commits in `Z:\simplecut` (oldest first): `intial commit` (owner), step 2, 3a, 3
 | 3 App shell: window, library, preview, read-only timeline, toolbar, real sound card, dialogs | done |
 | 4 Timeline editing with the mouse, mute/volume, zoom | done |
 | 5 Export | done |
-| **6 Robustness** | **next** |
-| 7 Retake seam | todo |
+| 6 Robustness | done |
+| **7 Retake seam** | **next** |
 | 8 Real sidecar and packaging | todo (depends on the owner's Python wrapper) |
 
-**Verified by tests (81):** editing invariants (no overlaps, picture and sound stay together), save/reopen, offline media, MP3 music, playback clock, 44.1 kHz resampling, edits during playback, media preview, thumbnails, timeline interactions, and full export flow (headless & UI dialog, monotonic progress, cancel, demux verification with FilmCraft, ffprobe stream validation, ffmpeg frame decoding, overwrite confirmation, open folder action).
+**Verified by tests (90):** editing invariants (no overlaps, picture and sound stay together), save/reopen, offline media, MP3 music, playback clock, 44.1 kHz resampling, edits during playback, media preview, thumbnails, timeline interactions, full export flow (headless & UI dialog, monotonic progress, cancel, demux verification with FilmCraft, ffprobe stream validation, ffmpeg frame decoding, overwrite confirmation, open folder action, editing input lock during export), autosave persistence, crash-recovery journal restore and discard, offline media relinking via preview and library, keyboard shortcuts modal and F1 toggle, panic handling, and crash log writing.
 **Verified by hand once:** the exe launches, stays responsive, finds hardware decoding.
 **Never verified:** audible sound through real speakers; how the UI looks (no screenshot was taken); preview frame rate on real 1080p footage; long projects.
 

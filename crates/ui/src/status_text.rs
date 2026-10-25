@@ -2,5 +2,5 @@
 
 /// The preview of an empty timeline: a headline and what to do about it.
 pub fn empty_timeline() -> (String, String) {
-    ("Your timeline is empty".into(), "Import a video, then double-click it in the library to add it.".into())
+    ("Your timeline is empty".into(), "Import video or audio, then double-click a clip or click 'Add to timeline' to begin editing.".into())
 }

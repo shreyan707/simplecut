@@ -84,6 +84,10 @@ pub enum Action {
     },
     CancelExport,
     OpenFolder(PathBuf),
+    RelinkMedia(ItemId),
+    OpenShortcuts,
+    Recover(Option<String>),
+    DiscardRecovery(Option<String>),
 }
 
 /// A line of feedback under the work area.
@@ -109,9 +113,18 @@ pub struct ExportModalState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RecoveryModalItem {
+    pub id: String,
+    pub name: String,
+    pub saved_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum Modal {
     Unsaved(Then),
     Export(ExportModalState),
+    Recovery { candidates: Vec<RecoveryModalItem>, selected: usize },
+    Shortcuts,
 }
 
 /// A library thumbnail.
@@ -239,6 +252,39 @@ impl SimpleCutApp {
         self.open_now(path);
     }
 
+    /// Start autosave persistence in `data_dir` and check for recovery candidates from dead sessions.
+    pub fn enable_autosave(&mut self, data_dir: PathBuf) {
+        if let Err(e) = self.editor.enable_autosave(data_dir) {
+            log::warn!("could not start autosave: {e}");
+            return;
+        }
+        self.check_recovery();
+    }
+
+    /// Check if previous crashed sessions left unsaved projects to recover.
+    pub fn check_recovery(&mut self) {
+        let candidates = self.editor.recovery_candidates();
+        if !candidates.is_empty() && self.modal.is_none() {
+            let list = candidates
+                .iter()
+                .map(|c| {
+                    let name = if c.meta.project_name.is_empty() { "Untitled".to_string() } else { c.meta.project_name.clone() };
+                    let saved_at = c.meta.saved_unix;
+                    RecoveryModalItem { id: c.id.clone(), name, saved_at: format!("{saved_at}") }
+                })
+                .collect();
+            self.modal = Some(Modal::Recovery { candidates: list, selected: 0 });
+        }
+    }
+
+    pub fn asking_about_recovery(&self) -> bool {
+        matches!(self.modal, Some(Modal::Recovery { .. }))
+    }
+
+    pub fn showing_shortcuts(&self) -> bool {
+        matches!(self.modal, Some(Modal::Shortcuts))
+    }
+
     pub(crate) fn queue(&mut self, a: Action) {
         self.queue.push(a);
     }
@@ -276,7 +322,7 @@ impl SimpleCutApp {
     pub fn perform(&mut self, action: Action) {
         if self.is_exporting() {
             match action {
-                Action::CancelExport | Action::DismissBanner | Action::OpenFolder(_) => {}
+                Action::CancelExport | Action::DismissBanner | Action::OpenFolder(_) | Action::OpenShortcuts => {}
                 Action::Seek(_) | Action::SeekTimeline(_) | Action::SeekStart | Action::SeekEnd | Action::Step(_) => {}
                 _ => {
                     self.fail(&EditorError::NotAvailable("Cannot make changes while an export is in progress.".into()));
@@ -400,6 +446,41 @@ impl SimpleCutApp {
             Action::StartExport { path, use_hardware } => self.start_export(path, use_hardware),
             Action::CancelExport => self.cancel_export(),
             Action::OpenFolder(path) => self.dialogs.open_folder(&path),
+            Action::RelinkMedia(id) => self.relink_media(id),
+            Action::OpenShortcuts => self.modal = Some(Modal::Shortcuts),
+            Action::Recover(id) => self.recover_project(id),
+            Action::DiscardRecovery(id) => {
+                let r = self.editor.discard_recovery(id.as_deref());
+                self.check(r);
+                self.modal = None;
+            }
+        }
+    }
+
+    fn relink_media(&mut self, id: ItemId) {
+        let name = self.editor.media_entry(id).map(|m| m.name).unwrap_or_else(|| "media".into());
+        let Some(path) = self.dialogs.pick_relink_path(&name) else { return };
+        match self.editor.relink(id, &path) {
+            Ok(()) => {
+                self.thumb_state.remove(&id);
+                self.media_cache = (0, None, Vec::new());
+                let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.info(format!("Relinked {name} to {filename}."));
+            }
+            Err(e) => self.fail(&e),
+        }
+    }
+
+    fn recover_project(&mut self, id: Option<String>) {
+        match self.editor.recover(id.as_deref()) {
+            Ok(()) => {
+                self.modal = None;
+                self.thumb_state.clear();
+                self.media_cache = (0, None, Vec::new());
+                self.source = Source::Timeline;
+                self.info(format!("Recovered unsaved changes to {}.", self.editor.project_name()));
+            }
+            Err(e) => self.fail(&e),
         }
     }
 
@@ -775,6 +856,7 @@ impl SimpleCutApp {
                     actions.push(a);
                 }
             };
+            key(Modifiers::NONE, Key::F1, Action::OpenShortcuts);
             key(Modifiers::NONE, Key::Space, Action::TogglePlay);
             key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z, Action::Redo);
             key(Modifiers::COMMAND, Key::Y, Action::Redo);
@@ -809,6 +891,7 @@ impl SimpleCutApp {
             self.modal = Some(Modal::Unsaved(Then::Close));
         }
         if self.close_now {
+            self.editor.shutdown();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -917,6 +1000,84 @@ impl SimpleCutApp {
                     self.perform(Action::StartExport { path, use_hardware });
                 }
             }
+            Modal::Recovery { candidates, mut selected } => {
+                let mut close = false;
+                let mut recover_id = None;
+                let mut discard_id = None;
+                egui::Window::new("Recover unsaved work").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                    ui.label("SimpleCut found unsaved changes from a previous session:");
+                    ui.add_space(8.0);
+                    for (i, item) in candidates.iter().enumerate() {
+                        let label = format!("{} ({})", item.name, item.saved_at);
+                        if ui.selectable_label(selected == i, label).clicked() {
+                            selected = i;
+                        }
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Recover work").clicked() {
+                            recover_id = candidates.get(selected).map(|c| c.id.clone());
+                            close = true;
+                        }
+                        if ui.button("Discard recovery").clicked() {
+                            discard_id = candidates.get(selected).map(|c| c.id.clone());
+                            close = true;
+                        }
+                        if ui.button("Not now").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if close {
+                    self.modal = None;
+                } else {
+                    self.modal = Some(Modal::Recovery { candidates, selected });
+                }
+                if let Some(id) = recover_id {
+                    self.perform(Action::Recover(Some(id)));
+                } else if let Some(id) = discard_id {
+                    self.perform(Action::DiscardRecovery(Some(id)));
+                }
+            }
+            Modal::Shortcuts => {
+                let mut close = false;
+                egui::Window::new("Keyboard Shortcuts").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                    ui.set_max_width(440.0);
+                    let t = theme::tokens();
+                    egui::Grid::new("shortcuts_grid").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, key: &str, desc: &str| {
+                            ui.label(RichText::new(key).strong().monospace().color(t.accent));
+                            ui.label(desc);
+                            ui.end_row();
+                        };
+                        row(ui, "Space", "Play / Pause");
+                        row(ui, "S", "Split clip at playhead");
+                        row(ui, "Delete / Backspace", "Delete selected clip(s)");
+                        row(ui, "Ctrl+Z / Cmd+Z", "Undo");
+                        row(ui, "Ctrl+Y / Ctrl+Shift+Z", "Redo");
+                        row(ui, "Ctrl+S", "Save project");
+                        row(ui, "Ctrl+Shift+S", "Save project as");
+                        row(ui, "Ctrl+O", "Open project");
+                        row(ui, "Ctrl+N", "New project");
+                        row(ui, "Ctrl+I", "Import media");
+                        row(ui, "Ctrl+E", "Export video");
+                        row(ui, "Left / Right Arrow", "Step 1 frame backward / forward");
+                        row(ui, "Home / End", "Seek to start / end of timeline");
+                        row(ui, "Alt + Drag Trim", "Ripple trim (moves later clips)");
+                        row(ui, "Ctrl + Mouse Wheel", "Zoom timeline in / out");
+                        row(ui, "F1", "Open keyboard shortcuts guide");
+                    });
+                    ui.add_space(14.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close shortcuts").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if close {
+                    self.modal = None;
+                }
+            }
         }
     }
 
@@ -976,15 +1137,52 @@ impl SimpleCutApp {
     }
 }
 
+impl Drop for SimpleCutApp {
+    fn drop(&mut self) {
+        self.editor.shutdown();
+    }
+}
+
 impl eframe::App for SimpleCutApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // a bug in one panel must not close the window and lose the user's work
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))).is_err() {
-            log::error!("the interface hit an internal error and carried on");
+        if let Err(err) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.frame(ui))) {
+            let msg = if let Some(s) = err.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = err.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown panic in UI frame".to_string()
+            };
+            log::error!("the interface hit an internal error and carried on: {msg}");
+            write_crash_log(&msg, self.editor.project_path());
             self.banner = Some(Banner { text: "Something went wrong in the interface. Your project is safe; try again.".into(), error: true, action: None });
             self.queue.clear();
         }
     }
+}
+
+/// Write a crash log entry when an internal UI error or panic occurs.
+pub fn write_crash_log(msg: &str, project_path: Option<&str>) {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let log_line =
+        format!("[{now}] SimpleCut Crash / Internal Error\nMessage: {msg}\nProject: {}\nOS: {}\n\n", project_path.unwrap_or("none"), std::env::consts::OS);
+
+    if let Some(p) = project_path {
+        let path = std::path::Path::new(p);
+        if let Some(parent) = path.parent() {
+            let crash_file = parent.join("simplecut-crash.log");
+            let _ = std::fs::OpenOptions::new().create(true).append(true).open(crash_file).and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(log_line.as_bytes())
+            });
+        }
+    }
+
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("simplecut-crash.log").and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(log_line.as_bytes())
+    });
 }
 
 pub(crate) fn to_image(f: &PreviewFrame) -> egui::ColorImage {

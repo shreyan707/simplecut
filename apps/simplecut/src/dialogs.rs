@@ -39,6 +39,15 @@ impl Dialogs for NativeDialogs {
         Some(path)
     }
 
+    fn pick_relink_path(&self, suggested_name: &str) -> Option<PathBuf> {
+        rfd::FileDialog::new()
+            .set_title(format!("Locate media for {suggested_name}"))
+            .add_filter("Video and audio", MEDIA)
+            .add_filter("All files", &["*"])
+            .set_file_name(suggested_name)
+            .pick_file()
+    }
+
     fn open_folder(&self, path: &std::path::Path) {
         #[cfg(target_os = "windows")]
         {
