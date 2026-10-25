@@ -4,6 +4,7 @@
 //! tested without a window. [`Editor`] is a thin, typed front over FilmCraft's engine `Session`,
 //! so projects are FilmCraft's native `.fcproj` and undo/redo is the engine's.
 
+mod analyzer;
 mod editor;
 mod error;
 mod export;
@@ -14,6 +15,7 @@ mod snapshot;
 mod thumbnails;
 mod view;
 
+pub use analyzer::{AnalysisJob, AnalysisRequest, Analyzer, FakeAnalyzer, JobState};
 pub use editor::{Edge, Editor, ItemId, Lane, PlaceAt, TrimMode};
 pub use error::{EditorError, Result};
 pub use export::{ExportJob, ExportOptions, ExportState, verify_export};

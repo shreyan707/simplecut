@@ -48,6 +48,10 @@ impl Dialogs for NativeDialogs {
             .pick_file()
     }
 
+    fn pick_analysis_file(&self) -> Option<PathBuf> {
+        rfd::FileDialog::new().set_title("Open retake analysis").add_filter("Retake analysis", &["json"]).pick_file()
+    }
+
     fn open_folder(&self, path: &std::path::Path) {
         #[cfg(target_os = "windows")]
         {

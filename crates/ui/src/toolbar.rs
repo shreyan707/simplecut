@@ -39,6 +39,19 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
             button(app, ui, "Shortcuts", "View keyboard shortcuts (F1)", Action::OpenShortcuts, true);
             ui.separator();
             button(app, ui, "Export", export_tip, Action::OpenExportDialog, can_export);
+            if app.has_analyzer() {
+                let busy = app.is_analyzing();
+                let tip = if is_exporting {
+                    "Wait for the export to finish."
+                } else if busy {
+                    "Looking for retakes…"
+                } else if !has_timeline {
+                    "Add a video to the timeline first."
+                } else {
+                    "Find failed takes in the video and review them before cutting."
+                };
+                button(app, ui, "Remove Retakes", tip, Action::StartRetakeAnalysis, has_timeline && !busy && !is_exporting);
+            }
             ui.add_space(8.0);
             let dirty = app.editor.is_dirty();
             let name = app.editor.project_name().to_string();

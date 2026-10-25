@@ -10,13 +10,14 @@ use std::time::Duration;
 
 use egui::{Align2, Key, Modifiers, RichText};
 use simplecut_core::{
-    AudioOutput, ClipId, Edge, Editor, EditorError, ExportJob, ExportOptions, ExportState, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState, Player,
-    PreviewFrame, PreviewRenderer, Snapshot, Target, Thumbnails, Tick, TrackId, TrimMode,
+    Analyzer, AudioOutput, ClipId, Edge, Editor, EditorError, ExportJob, ExportOptions, ExportState, FrameRate, ItemId, Lane, MediaEntry, PlaceAt, PlayState,
+    Player, PreviewFrame, PreviewRenderer, Snapshot, Target, Thumbnails, Tick, TrackId, TrimMode,
 };
 
 use crate::dialogs::Dialogs;
+use crate::retakes::RetakeUi;
 use crate::timeline::TimelineUi;
-use crate::{library, preview, theme, timeline, toolbar};
+use crate::{library, preview, retakes, theme, timeline, toolbar};
 
 /// What the preview area shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +89,21 @@ pub enum Action {
     OpenShortcuts,
     Recover(Option<String>),
     DiscardRecovery(Option<String>),
+    /// Look for retakes in the video on the timeline (needs a detector).
+    StartRetakeAnalysis,
+    CancelAnalysis,
+    /// Choose an analysis file (see docs/retake-contract.md) and review it.
+    OpenAnalysisFile,
+    LoadAnalysis(PathBuf),
+    /// Select or deselect one suggestion.
+    ToggleProposal(ItemId, String),
+    /// Select what the detector is sure about.
+    ApproveSure,
+    ApproveNone,
+    GoToProposal(ItemId, String),
+    /// Cut the selected suggestions out of the video.
+    ApplyRetakes,
+    CloseReview,
 }
 
 /// A line of feedback under the work area.
@@ -149,7 +165,9 @@ pub struct SimpleCutApp {
     pub(crate) player: Player,
     renderer: PreviewRenderer,
     thumbs: Thumbnails,
-    dialogs: Box<dyn Dialogs>,
+    pub(crate) dialogs: Box<dyn Dialogs>,
+    pub(crate) analyzer: Option<Box<dyn Analyzer>>,
+    pub(crate) retakes: RetakeUi,
 
     pub(crate) source: Source,
     /// Position in the previewed file (the timeline's is the editor's playhead).
@@ -185,6 +203,8 @@ impl SimpleCutApp {
             renderer: PreviewRenderer::new(),
             thumbs: Thumbnails::new(),
             dialogs,
+            analyzer: None,
+            retakes: RetakeUi::default(),
             source: Source::Timeline,
             media_time: Tick::ZERO,
             thumb_state: HashMap::new(),
@@ -304,6 +324,14 @@ impl SimpleCutApp {
         self.banner = Some(Banner { text: text.into(), error: false, action: None });
     }
 
+    pub(crate) fn info_text(&mut self, text: impl Into<String>) {
+        self.info(text);
+    }
+
+    pub(crate) fn fail_text(&mut self, text: &str) {
+        self.banner = Some(Banner { text: text.to_string(), error: true, action: None });
+    }
+
     fn fail(&mut self, e: &EditorError) {
         self.banner = Some(Banner { text: e.to_string(), error: true, action: None });
     }
@@ -331,6 +359,16 @@ impl SimpleCutApp {
             }
         }
         match action {
+            Action::StartRetakeAnalysis
+            | Action::CancelAnalysis
+            | Action::OpenAnalysisFile
+            | Action::LoadAnalysis(_)
+            | Action::ToggleProposal(..)
+            | Action::ApproveSure
+            | Action::ApproveNone
+            | Action::GoToProposal(..)
+            | Action::ApplyRetakes
+            | Action::CloseReview => self.perform_retake(action),
             Action::NewProject => self.guard_unsaved(Then::New),
             Action::OpenProject => {
                 if let Some(path) = self.dialogs.pick_project_to_open() {
@@ -684,6 +722,7 @@ impl SimpleCutApp {
         }
         self.active_export = None;
         self.player.pause();
+        self.retakes = RetakeUi::default();
         self.source = Source::Timeline;
         self.media_time = Tick::ZERO;
         self.thumb_state.clear();
@@ -746,6 +785,7 @@ impl SimpleCutApp {
         self.editor.session_mut().poll_persistence();
 
         let state = self.player.tick(&mut self.editor);
+        self.pump_retakes();
         if matches!(self.player.target(), Some(Target::Media(_))) && matches!(self.source, Source::Media(_)) {
             self.media_time = self.player.position();
         }
@@ -812,7 +852,8 @@ impl SimpleCutApp {
             }
         }
 
-        let busy = self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle() || self.active_export.is_some();
+        let busy =
+            self.player.is_playing() || !self.renderer.is_idle() || !self.thumbs.is_idle() || self.active_export.is_some() || self.retakes.running.is_some();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -866,6 +907,7 @@ impl SimpleCutApp {
             key(Modifiers::COMMAND, Key::O, Action::OpenProject);
             key(Modifiers::COMMAND, Key::N, Action::NewProject);
             key(Modifiers::COMMAND, Key::I, Action::Import);
+            key(Modifiers::COMMAND | Modifiers::SHIFT, Key::R, Action::OpenAnalysisFile);
             key(Modifiers::NONE, Key::Home, Action::SeekStart);
             key(Modifiers::NONE, Key::End, Action::SeekEnd);
             key(Modifiers::NONE, Key::ArrowLeft, Action::Step(-1));
@@ -1100,6 +1142,11 @@ impl SimpleCutApp {
         egui::Panel::left("library").resizable(true).default_size(330.0).min_size(240.0).show(ui, |ui| {
             ui.add_enabled_ui(!self.is_exporting(), |ui| library::show(self, ui));
         });
+        if self.retakes.visible() {
+            egui::Panel::right("retakes").resizable(true).default_size(340.0).min_size(260.0).show(ui, |ui| {
+                ui.add_enabled_ui(!self.is_exporting(), |ui| retakes::panel(self, ui));
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_enabled_ui(!self.is_exporting(), |ui| preview::show(self, ui));
         });

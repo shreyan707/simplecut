@@ -183,6 +183,7 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
             t.text_dim,
         );
     }
+    paint_review(app, &painter, &axis, &lanes);
     paint_drag(app, &painter, &seq, &axis, &lanes, &clips, lanes_rect);
 
     // playhead
@@ -443,6 +444,21 @@ fn interact(app: &mut SimpleCutApp, ui: &egui::Ui, resp: &egui::Response, seq: &
                 app.queue(Action::SeekTimeline(axis.time_at(p.x)));
             }
         }
+    }
+}
+
+/// Where the retake suggestions are: shaded over the picture and its sound.
+fn paint_review(app: &SimpleCutApp, painter: &egui::Painter, axis: &Axis, lanes: &[Rect]) {
+    let ranges = app.review_ranges();
+    if ranges.is_empty() {
+        return;
+    }
+    let t = theme::tokens();
+    let (Some(top), Some(bottom)) = (lanes.first(), lanes.get(1)) else { return };
+    for (start, end, approved) in ranges {
+        let r = Rect::from_min_max(pos2(axis.x_of(start), top.top()), pos2(axis.x_of(end).max(axis.x_of(start) + 2.0), bottom.bottom()));
+        painter.rect_filled(r, CornerRadius::same(3), t.danger.gamma_multiply(if approved { 0.45 } else { 0.18 }));
+        painter.rect_stroke(r, CornerRadius::same(3), Stroke::new(if approved { 2.0 } else { 1.0 }, t.danger), StrokeKind::Inside);
     }
 }
 

@@ -14,6 +14,8 @@ pub trait Dialogs {
     fn pick_export_path(&self, suggested_name: &str) -> Option<PathBuf>;
     /// Choose a replacement file to relink offline media; `suggested_name` is the original file name.
     fn pick_relink_path(&self, suggested_name: &str) -> Option<PathBuf>;
+    /// Choose a retake analysis file (JSON, see docs/retake-contract.md).
+    fn pick_analysis_file(&self) -> Option<PathBuf>;
     /// Open the system file browser showing the given file/folder.
     fn open_folder(&self, path: &std::path::Path);
 }
@@ -39,6 +41,10 @@ impl Dialogs for NoDialogs {
     }
 
     fn pick_relink_path(&self, _suggested_name: &str) -> Option<PathBuf> {
+        None
+    }
+
+    fn pick_analysis_file(&self) -> Option<PathBuf> {
         None
     }
 

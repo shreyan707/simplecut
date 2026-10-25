@@ -39,6 +39,10 @@ fn main() -> eframe::Result {
                 .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SimpleCut")))
                 .unwrap_or_else(|| PathBuf::from(".simplecut"));
             app.enable_autosave(data_dir);
+            // a stand-in detector so the whole retake flow can be tried before a real one exists
+            if std::env::var_os("SIMPLECUT_FAKE_RETAKES").is_some() {
+                app.set_analyzer(Some(Box::new(simplecut_core::FakeAnalyzer::default())));
+            }
             if let Some(path) = open {
                 app.open_project_path(path);
             }

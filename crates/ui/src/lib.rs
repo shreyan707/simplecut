@@ -8,6 +8,7 @@ mod dialogs;
 mod format;
 mod library;
 mod preview;
+mod retakes;
 mod status;
 mod status_text;
 mod theme;

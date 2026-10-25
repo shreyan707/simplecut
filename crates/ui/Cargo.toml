@@ -16,6 +16,7 @@ eframe = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 egui_kittest = { workspace = true, features = ["eframe"] }
 # the test harness starts eframe, which needs a renderer compiled in
 eframe = { workspace = true, features = ["glow"] }

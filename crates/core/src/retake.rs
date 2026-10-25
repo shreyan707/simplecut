@@ -289,12 +289,52 @@ impl Editor {
         validate(parse(json)?, item, entry.duration)
     }
 
-    /// Cut `proposals` (all for media file `item`) out of the timeline as one undo step: picture and
-    /// sound together, gaps closed. Each proposal is converted from the file's time to timeline time
-    /// through every clip that shows that part of the file, so trimmed, moved or repeated clips are
-    /// right. Overlapping cuts are merged and the result is rounded to whole frames.
+    /// Which file of this project a document is for: the one whose length matches, and if several
+    /// do, the one with the same file name.
+    pub fn find_media_for(&self, doc: &RetakeDocument) -> Result<ItemId> {
+        let want = doc.media.duration_seconds;
+        let near: Vec<_> = self.media().into_iter().filter(|m| (m.duration.0 as f64 / 254_016_000_000.0 - want).abs() <= DURATION_TOLERANCE_SECS).collect();
+        let file_name = doc.media.path.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
+        match near.len() {
+            0 => Err(EditorError::Invalid(format!("None of the files in this project matches that analysis (it is for a {want:.1} s video)."))),
+            1 => Ok(near[0].id),
+            _ => {
+                let named: Vec<_> = near.iter().filter(|m| m.name.to_lowercase() == file_name).collect();
+                match named.as_slice() {
+                    [one] => Ok(one.id),
+                    _ => Err(EditorError::Invalid("More than one file in this project could be the one that analysis is for.".into())),
+                }
+            }
+        }
+    }
+
+    /// Where the part of file `item` that `p` covers is on the timeline: one range per clip of the
+    /// main video track that shows it. Not rounded to frames; for drawing and for "go to".
+    pub fn timeline_ranges(&self, item: ItemId, p: &CutProposal) -> Vec<(Tick, Tick)> {
+        let Some(q) = self.session().active_sequence() else { return Vec::new() };
+        let Some(track) = q.video_tracks.first() else { return Vec::new() };
+        let mut out = Vec::new();
+        for clip in track.items.iter().filter(|c| c.item == item && (c.speed - 1.0).abs() <= f64::EPSILON && c.frame_hold.is_none()) {
+            let (src_lo, src_hi) = (clip.source_in, clip.source_in + clip.duration);
+            let (lo, hi) = (p.start.max(src_lo), p.end.min(src_hi));
+            if lo < hi {
+                out.push((clip.start + (lo - src_lo), clip.start + (hi - src_lo)));
+            }
+        }
+        out
+    }
+
+    /// Cut `proposals` (all for media file `item`) out of the timeline: see [`Editor::apply_cut_sets`].
     pub fn apply_cuts(&mut self, item: ItemId, proposals: &[CutProposal], scope: CutScope) -> Result<ApplyReport> {
-        if proposals.is_empty() {
+        self.apply_cut_sets(&[(item, proposals.to_vec())], scope)
+    }
+
+    /// Cut the proposals of one or more media files out of the timeline as one undo step: picture
+    /// and sound together, gaps closed. Each proposal is converted from the file's time to timeline
+    /// time through every clip that shows that part of the file, so trimmed, moved or repeated
+    /// clips are right. Overlapping cuts are merged and the result is rounded to whole frames.
+    pub fn apply_cut_sets(&mut self, sets: &[(ItemId, Vec<CutProposal>)], scope: CutScope) -> Result<ApplyReport> {
+        if sets.iter().all(|(_, p)| p.is_empty()) {
             return Err(EditorError::NothingSelected);
         }
         let mut notes = Vec::new();
@@ -307,16 +347,21 @@ impl Editor {
             };
             let mut ranges: Vec<(Tick, Tick)> = Vec::new();
             for track in q.video_tracks.iter().chain(q.audio_tracks.iter()).filter(|t| targets.contains(&t.id)) {
-                for clip in track.items.iter().filter(|c| c.item == item) {
-                    if (clip.speed - 1.0).abs() > f64::EPSILON || clip.frame_hold.is_some() {
-                        notes.push(format!("“{}” has its speed changed, so it was left as it is.", clip.name));
-                        continue;
-                    }
-                    let (src_lo, src_hi) = (clip.source_in, clip.source_in + clip.duration);
-                    for p in proposals {
-                        let (lo, hi) = (p.start.max(src_lo), p.end.min(src_hi));
-                        if lo < hi {
-                            ranges.push((clip.start + (lo - src_lo), clip.start + (hi - src_lo)));
+                for (item, proposals) in sets {
+                    for clip in track.items.iter().filter(|c| c.item == *item) {
+                        if (clip.speed - 1.0).abs() > f64::EPSILON || clip.frame_hold.is_some() {
+                            let note = format!("“{}” has its speed changed, so it was left as it is.", clip.name);
+                            if !notes.contains(&note) {
+                                notes.push(note);
+                            }
+                            continue;
+                        }
+                        let (src_lo, src_hi) = (clip.source_in, clip.source_in + clip.duration);
+                        for p in proposals {
+                            let (lo, hi) = (p.start.max(src_lo), p.end.min(src_hi));
+                            if lo < hi {
+                                ranges.push((clip.start + (lo - src_lo), clip.start + (hi - src_lo)));
+                            }
                         }
                     }
                 }
