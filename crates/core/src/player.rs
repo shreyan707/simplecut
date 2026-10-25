@@ -139,7 +139,9 @@ fn make_fill(ring: Arc<Ring>, delivered: Arc<AtomicU64>) -> FillFn {
 }
 
 /// Mix ahead of the card until told to stop.
-fn mix_loop(snapshot: Snapshot, start_sample: i64, device_rate: u32, ring: Arc<Ring>, stop: Arc<AtomicBool>) {
+/// `skips` are sample ranges (at the sequence rate, sorted, disjoint) that are never mixed: the mixer jumps
+/// over them inside the same stream, so the card never stops and there is no gap in the sound.
+fn mix_loop(snapshot: Snapshot, start_sample: i64, device_rate: u32, ring: Arc<Ring>, stop: Arc<AtomicBool>, skips: Vec<(i64, i64)>) {
     let seq_rate = snapshot.sample_rate();
     let end_sample = snapshot.duration().to_units_floor(i64::from(seq_rate));
     let target = (AHEAD.as_secs_f64() * f64::from(device_rate)) as usize * 2;
@@ -151,22 +153,28 @@ fn mix_loop(snapshot: Snapshot, start_sample: i64, device_rate: u32, ring: Arc<R
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
-        let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snapshot.mix_audio(pos, BLOCK)));
+        if let Some(&(_, e)) = skips.iter().find(|&&(s, e)| s <= pos && pos < e) {
+            pos = e;
+            continue;
+        }
+        // stop a block exactly where the next skip begins
+        let n = skips.iter().find(|&&(s, _)| s > pos).map_or(BLOCK, |&(s, _)| BLOCK.min(usize::try_from(s - pos).unwrap_or(BLOCK)).max(1));
+        let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| snapshot.mix_audio(pos, n)));
         let block: Vec<[f32; 2]> = match mixed {
             Ok(Some(b)) => {
                 let (l, r) = (b.channels.first(), b.channels.get(1).or(b.channels.first()));
-                (0..BLOCK).map(|i| [l.and_then(|c| c.get(i)).copied().unwrap_or(0.0), r.and_then(|c| c.get(i)).copied().unwrap_or(0.0)]).collect()
+                (0..n).map(|i| [l.and_then(|c| c.get(i)).copied().unwrap_or(0.0), r.and_then(|c| c.get(i)).copied().unwrap_or(0.0)]).collect()
             }
-            Ok(None) => vec![[0.0; 2]; BLOCK],
+            Ok(None) => vec![[0.0; 2]; n],
             Err(_) => {
                 log::error!("mixing the sound failed at sample {pos}; playing silence there");
-                vec![[0.0; 2]; BLOCK]
+                vec![[0.0; 2]; n]
             }
         };
         out.clear();
         resampler.process(&block, &mut out);
         ring.lock().extend(out.iter().copied());
-        pos += BLOCK as i64;
+        pos += n as i64;
     }
 }
 
@@ -193,7 +201,11 @@ pub struct Player {
     /// Where playback is (or stopped): the sequence playhead, or the position in the media file.
     position: Tick,
     skips: Vec<(Tick, Tick)>,
+    /// The skips the current run was started with (the mixer and the clock must agree on them).
+    active_skips: Vec<(Tick, Tick)>,
     skips_counted: usize,
+    /// `skips_counted` when the current run began.
+    count_base: usize,
 }
 
 impl Player {
@@ -209,7 +221,9 @@ impl Player {
             restarts: 0,
             position: Tick::ZERO,
             skips: Vec::new(),
+            active_skips: Vec::new(),
             skips_counted: 0,
+            count_base: 0,
         }
     }
 
@@ -400,6 +414,7 @@ impl Player {
         };
         let end = snapshot.duration();
         let now = self.clock();
+        self.skips_counted = self.count_base + self.crossed();
         let media = matches!(snapshot.target(), Target::Media(_));
         if now >= end {
             self.halt();
@@ -410,9 +425,14 @@ impl Player {
             }
             return PlayState::Ended;
         }
-        if !media && let Some((_s, e)) = self.find_skip(now) {
-            self.skips_counted += 1;
-            if e >= end {
+        // the skips were changed while playing (the user ticked something): restart once with the new ones
+        if !media && self.skips != self.active_skips {
+            let mut from = now;
+            if let Some((_s, e)) = self.find_skip(from) {
+                from = e;
+                self.skips_counted += 1;
+            }
+            if from >= end {
                 self.halt();
                 self.playing = false;
                 self.position = end;
@@ -420,9 +440,9 @@ impl Player {
                 return PlayState::Ended;
             }
             self.halt();
-            self.begin(snapshot.clone(), e);
-            self.position = e;
-            editor.set_playhead(e);
+            self.begin(snapshot, from);
+            self.position = from;
+            editor.set_playhead(from);
             return PlayState::Playing;
         }
         self.position = now;
@@ -440,18 +460,38 @@ impl Player {
         PlayState::Playing
     }
 
-    /// The playback clock: where the playhead should be now.
+    /// The playback clock: where the playhead should be now. Time that the mixer skipped is added back,
+    /// so the playhead jumps over a skip at the moment the sound does.
     pub fn clock(&self) -> Tick {
-        match &self.feeder {
+        let raw = match &self.feeder {
             Some(f) => self.origin + Tick::from_units(i64::try_from(f.delivered.load(Ordering::Relaxed)).unwrap_or(i64::MAX), i64::from(f.device_rate.max(1))),
             None => self.origin + Tick::from_seconds_f64(self.started.map(|s| s.elapsed().as_secs_f64()).unwrap_or(0.0)),
+        };
+        let mut t = raw;
+        for &(s, e) in &self.active_skips {
+            if e <= self.origin {
+                continue;
+            }
+            if t < s {
+                break;
+            }
+            t = Tick(t.0.saturating_add(e.0.saturating_sub(s.0.max(self.origin.0))));
         }
+        t
+    }
+
+    /// How many skips the clock has gone over in this run.
+    fn crossed(&self) -> usize {
+        let raw = self.clock();
+        self.active_skips.iter().filter(|&&(_, e)| e > self.origin && e <= raw).count()
     }
 
     fn begin(&mut self, snapshot: Snapshot, from: Tick) {
         self.origin = from;
         self.position = from;
         self.started = Some(Instant::now());
+        self.active_skips = if matches!(snapshot.target(), Target::Sequence(_)) { self.skips.clone() } else { Vec::new() };
+        self.count_base = self.skips_counted;
         self.feeder = self.start_feeder(&snapshot, from);
         self.snapshot = Some(snapshot);
     }
@@ -475,7 +515,9 @@ impl Player {
         let stop = Arc::new(AtomicBool::new(false));
         let start_sample = from.to_units_floor(i64::from(snapshot.sample_rate()));
         let (snap, r, s) = (snapshot.clone(), ring, stop.clone());
-        let worker = std::thread::Builder::new().name("simplecut-mixer".into()).spawn(move || mix_loop(snap, start_sample, device_rate, r, s));
+        let rate = i64::from(snapshot.sample_rate());
+        let skips: Vec<(i64, i64)> = self.active_skips.iter().map(|&(a, b)| (a.to_units_floor(rate), b.to_units_floor(rate))).collect();
+        let worker = std::thread::Builder::new().name("simplecut-mixer".into()).spawn(move || mix_loop(snap, start_sample, device_rate, r, s, skips));
         match worker {
             Ok(w) => Some(Feeder { stop, worker: Some(w), delivered, device_rate }),
             Err(e) => {

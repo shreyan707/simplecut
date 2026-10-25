@@ -293,8 +293,33 @@ fn playback_skips_unticked_sentences_and_handles_edits() {
     e.set_track_muted(dialogue, true).unwrap();
     assert_eq!(p.tick(&mut e), PlayState::Playing);
     assert_eq!(p.restarts(), 1, "restarted on edit");
-    // Pump rest of b up to 2.0s
-    pump_until(&card, &p, 48_000);
+    // Pump rest of b up to 2.0s (the run restarted at about 1.2 s, so 0.8 s of b is left)
+    pump_until(&card, &p, 38_400);
     assert_eq!(p.tick(&mut e), PlayState::Ended);
     assert_eq!(p.skips(), 1, "c was still skipped after project edit");
+}
+
+#[test]
+fn skipping_does_not_restart_the_sound_card_and_leaves_no_gap() {
+    let Some((mut e, _item, _dir)) = project() else { return };
+    let card = Card::new(48_000);
+    let mut p = Player::new(Some(Box::new(card.clone())));
+    // keep 0.0-1.0 and 2.0-4.0 of the 4 s tone; skip 1.0-2.0
+    p.set_skips(vec![(secs(1.0), secs(2.0))]);
+    e.set_playhead(secs(0.5));
+    p.play(&mut e).unwrap();
+    // 0.5 s before the skip and 0.5 s after it, in one unbroken run of the card
+    let heard = pump_until(&card, &p, 48_000);
+    assert_eq!(card.starts.load(std::sync::atomic::Ordering::Relaxed), 1, "the card was started once and never restarted for the skip");
+    assert_eq!(p.restarts(), 0);
+    assert!(heard.len() >= 96_000, "at least 1 s of stereo frames");
+    // every 10 ms window has the tone: no gap at the join (0.5 s in)
+    for w in heard.chunks(960) {
+        assert!(rms(w) > 0.01, "a silent hole in the sound");
+    }
+    // the playhead is already past the skip: 0.5 s + 0.5 s of sound + the skipped second
+    assert_eq!(p.tick(&mut e), PlayState::Playing);
+    assert!(within_a_frame(e.playhead(), secs(2.5)), "{:?}", e.playhead());
+    assert_eq!(p.skips(), 1);
+    assert_eq!(card.starts.load(std::sync::atomic::Ordering::Relaxed), 1, "ticking over the skip did not restart the card either");
 }

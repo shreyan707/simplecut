@@ -62,15 +62,17 @@ pub struct Card {
     pub rate: u32,
     pub broken: bool,
     pub fill: Arc<Mutex<Option<Fill>>>,
+    /// How many times the card was started (a restart of playback starts it again).
+    pub starts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Card {
     pub fn new(rate: u32) -> Self {
-        Card { rate, broken: false, fill: Arc::default() }
+        Card { rate, broken: false, fill: Arc::default(), starts: Arc::default() }
     }
 
     pub fn broken() -> Self {
-        Card { rate: 48_000, broken: true, fill: Arc::default() }
+        Card { rate: 48_000, broken: true, fill: Arc::default(), starts: Arc::default() }
     }
 
     /// The card asks for `frames` stereo frames.
@@ -88,6 +90,7 @@ impl AudioOutput for Card {
         if self.broken {
             return Err("no such device".into());
         }
+        self.starts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.fill.lock().unwrap() = Some(fill);
         Ok(self.rate)
     }
