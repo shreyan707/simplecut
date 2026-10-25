@@ -9,7 +9,7 @@
 mod common;
 
 use common::{have, make_clip, make_music, scratch};
-use simplecut_core::retake::{CutProposal, CutScope, Decision};
+use simplecut_core::retake::{CutProposal, CutScope, Decision, Presence};
 use simplecut_core::{Edge, Editor, EditorError, ItemId, Lane, PlaceAt, SequenceView, Tick, TrackView, TrimMode};
 
 const TPS: f64 = 254_016_000_000.0;
@@ -213,4 +213,46 @@ fn a_document_is_read_checked_against_the_file_and_applied() {
     let wrong = json.replace("10.0", "60.0");
     assert!(matches!(e.read_analysis(&wrong, item), Err(EditorError::Invalid(m)) if m.contains("different file")));
     assert_eq!(e.read_analysis(json, ItemId(987_654)).unwrap_err(), EditorError::NoSuchMedia);
+}
+
+#[test]
+fn presence_reports_on_off_and_handles_speed_changed_and_frame_hold_clips() {
+    let Some((mut e, item)) = project() else { return };
+
+    let p = proposal("a", 2.0, 3.0);
+    assert_eq!(e.presence(item, &p), Presence::On);
+    assert!(!e.is_outside_used(item, &p));
+
+    // Wholly outside what is on the timeline (e.g. beyond 10 s)
+    let p_late = proposal("late", 12.0, 13.0);
+    assert_eq!(e.presence(item, &p_late), Presence::Off);
+    assert!(e.is_outside_used(item, &p_late));
+
+    // Sliver case: 1.0 s proposal, but only 0.05 s (< 10%) covered -> Off
+    let clip = track(&e.sequence().unwrap(), "Video").clips[0].id;
+    // Trim start so only 2.95s to 10s is on the timeline: proposal 2.0..3.0 has only 2.95..3.0 (0.05s) on timeline
+    e.trim(clip, Edge::Start, secs(2.95), TrimMode::Ripple).unwrap();
+    assert_eq!(e.presence(item, &p), Presence::Off);
+
+    // Speed-changed clip: no mapped ranges, so Off, and is_outside_used is true so not reported as already removed
+    let Some((mut e2, item2)) = project() else { return };
+    e2.session_mut()
+        .edit_sequence("speed", |seq, _, _| {
+            seq.video_tracks[0].items[0].speed = 1.5;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(e2.presence(item2, &p), Presence::Off);
+    assert!(e2.is_outside_used(item2, &p));
+
+    // Frame-hold clip: also Off and is_outside_used is true
+    let Some((mut e3, item3)) = project() else { return };
+    e3.session_mut()
+        .edit_sequence("hold", |seq, _, _| {
+            seq.video_tracks[0].items[0].frame_hold = Some(Tick(0));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(e3.presence(item3, &p), Presence::Off);
+    assert!(e3.is_outside_used(item3, &p));
 }

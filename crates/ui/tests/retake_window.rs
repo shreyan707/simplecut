@@ -234,3 +234,142 @@ fn an_analysis_file_made_by_hand_can_be_loaded() {
     assert!(h.state().banner().unwrap().text.contains("could not be found"));
     assert_eq!(h.state().review_summary(), Some((1, 1)), "failed loads leave the open review alone");
 }
+
+#[test]
+fn undo_and_redo_with_review_open_brings_suggestions_back() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    assert_eq!(h.state().review_marker_rects().len(), 3);
+
+    click(&mut h, "Remove 2 retakes");
+    assert_eq!(h.state().review_summary(), Some((1, 0)));
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+
+    click(&mut h, "Undo");
+    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    assert!(h.state().review_is_approved("fake_0:0"));
+    assert!(h.state().review_is_approved("fake_2:0"));
+    assert_eq!(h.state().review_marker_rects().len(), 3);
+
+    click(&mut h, "Redo");
+    assert_eq!(h.state().review_summary(), Some((1, 0)));
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+}
+
+#[test]
+fn rerun_analysis_on_cut_video_lists_cut_ones_as_already_removed_without_sliver() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+    click(&mut h, "Remove 2 retakes");
+
+    click(&mut h, "Remove Retakes");
+    step_until(&mut h, "the re-analysis", |a| !a.is_analyzing());
+
+    assert_eq!(h.state().review_summary(), Some((1, 0)));
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+    assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled());
+    assert!(h.state().banner().is_some_and(|b| !b.error));
+}
+
+#[test]
+fn a_suggestion_more_than_90_percent_cut_is_off_and_has_no_marker() {
+    if skip() {
+        return;
+    }
+    let (mut h, script, dir) = common::harness::with_media();
+    let video = item(&h, "talk.mp4");
+    h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
+    h.step();
+
+    // Trim the start by 0.95 s of a 1.0 s suggestion (leaves only 5% of it on timeline)
+    let clip = h.state().editor().sequence().unwrap().tracks[0].clips[0].id;
+    h.state_mut().perform(Action::TrimClip { clip, edge: simplecut_core::Edge::Start, delta: Tick::from_seconds_f64(0.95), ripple: true });
+    h.step();
+
+    let path = dir.join("sliver.retakes.json");
+    let json = serde_json::json!({
+        "schema": "simplecut.retakes/1",
+        "media": { "path": "D:/talk.mp4", "duration_seconds": 4.0 },
+        "proposals": [
+            { "id": "s:0", "start": 0.0, "end": 1.0, "confidence": 0.9 }
+        ]
+    });
+    std::fs::write(&path, json.to_string()).unwrap();
+    script.analysis.lock().unwrap().push_back(path);
+    h.state_mut().perform(Action::OpenAnalysisFile);
+    h.step();
+
+    // Only 0.05s (5%) is on the timeline: should be Off, so review_summary is (0, 0) and 0 markers
+    assert_eq!(h.state().review_summary(), Some((0, 0)));
+    assert_eq!(h.state().review_marker_rects().len(), 0);
+}
+
+#[test]
+fn trimming_clip_moves_suggestion_to_outside_used_part_and_undo_returns_it() {
+    if skip() {
+        return;
+    }
+    let (mut h, script, dir) = common::harness::with_media();
+    let video = item(&h, "talk.mp4");
+    h.state_mut().perform(Action::AddToTimeline(video, Lane::Main));
+    h.step();
+
+    let path = dir.join("trim.retakes.json");
+    let json = serde_json::json!({
+        "schema": "simplecut.retakes/1",
+        "media": { "path": "D:/talk.mp4", "duration_seconds": 4.0 },
+        "proposals": [
+            { "id": "t:0", "start": 0.5, "end": 1.0, "confidence": 0.9 },
+            { "id": "t:1", "start": 2.5, "end": 3.0, "confidence": 0.9 }
+        ]
+    });
+    std::fs::write(&path, json.to_string()).unwrap();
+    script.analysis.lock().unwrap().push_back(path);
+    h.state_mut().perform(Action::OpenAnalysisFile);
+    h.step();
+
+    assert_eq!(h.state().review_summary(), Some((2, 2)));
+
+    // Trim the start of the clip past 1.0s (1.5s delta ripple): t:0 is outside the used part
+    let clip = h.state().editor().sequence().unwrap().tracks[0].clips[0].id;
+    h.state_mut().perform(Action::TrimClip { clip, edge: simplecut_core::Edge::Start, delta: Tick::from_seconds_f64(1.5), ripple: true });
+    h.step();
+
+    assert_eq!(h.state().review_summary(), Some((1, 1)));
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+
+    // Undo returns t:0 to On
+    click(&mut h, "Undo");
+    assert_eq!(h.state().review_summary(), Some((2, 2)));
+    assert_eq!(h.state().review_marker_rects().len(), 2);
+}
+
+#[test]
+fn counts_and_button_label_ignore_off_suggestions() {
+    if skip() {
+        return;
+    }
+    let mut h = ready(FakeAnalyzer::default());
+    analyse(&mut h);
+    assert_eq!(h.state().review_summary(), Some((3, 2)));
+    h.get_by_label("Remove 2 retakes");
+
+    // Remove the 2 retakes
+    click(&mut h, "Remove 2 retakes");
+    // Now 2 are Off, only 1 is On (and it was a review one, unselected)
+    assert_eq!(h.state().review_summary(), Some((1, 0)));
+    assert!(h.get_by_label("Remove 0 retakes").accesskit_node().is_disabled());
+    assert_eq!(h.state().review_marker_rects().len(), 1);
+
+    // Select the 1 remaining suggestion
+    click(&mut h, "Select suggestion fake_1:0");
+    assert_eq!(h.state().review_summary(), Some((1, 1)));
+    assert!(!h.get_by_label("Remove 1 retake").accesskit_node().is_disabled());
+}

@@ -148,6 +148,13 @@ pub struct CutProposal {
     pub group: Option<String>,
 }
 
+/// Whether a proposal is currently on the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    On,
+    Off,
+}
+
 /// A proposal that was dropped, and why.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rejected {
@@ -322,6 +329,41 @@ impl Editor {
             }
         }
         out
+    }
+
+    /// Whether proposal `p` (for media file `item`) is currently on the timeline.
+    ///
+    /// Returns [`Presence::Off`] if the total covered length on the main video track is less
+    /// than one frame of the sequence or less than 10 % of the proposal's own duration (preventing
+    /// rounding slivers from showing as suggestions). Clips with changed speed or frame hold have
+    /// no mapped ranges and are therefore `Off`.
+    pub fn presence(&self, item: ItemId, p: &CutProposal) -> Presence {
+        let ranges = self.timeline_ranges(item, p);
+        let covered: Tick = ranges.iter().fold(Tick::ZERO, |acc, (s, e)| acc + (*e - *s));
+        let frame_duration =
+            self.session().active_sequence().map(|q| q.settings.frame_rate.frame_duration()).unwrap_or_else(|| Tick::from_seconds_f64(1.0 / 30.0));
+        let p_len = if p.end > p.start { Tick((p.end.0 - p.start.0) / 10) } else { Tick::ZERO };
+        let min_threshold = frame_duration.max(p_len);
+        if covered < min_threshold { Presence::Off } else { Presence::On }
+    }
+
+    /// Whether proposal `p` (for media file `item`) falls completely outside the used source range
+    /// of normal clips on the main video track.
+    pub fn is_outside_used(&self, item: ItemId, p: &CutProposal) -> bool {
+        let Some(q) = self.session().active_sequence() else { return true };
+        let Some(track) = q.video_tracks.first() else { return true };
+        let mut min_src: Option<Tick> = None;
+        let mut max_src: Option<Tick> = None;
+        for clip in track.items.iter().filter(|c| c.item == item && (c.speed - 1.0).abs() <= f64::EPSILON && c.frame_hold.is_none()) {
+            let lo = clip.source_in;
+            let hi = clip.source_in + clip.duration;
+            min_src = Some(min_src.map_or(lo, |m| m.min(lo)));
+            max_src = Some(max_src.map_or(hi, |m| m.max(hi)));
+        }
+        match (min_src, max_src) {
+            (Some(lo), Some(hi)) => p.end <= lo || p.start >= hi,
+            _ => true,
+        }
     }
 
     /// Cut `proposals` (all for media file `item`) out of the timeline: see [`Editor::apply_cut_sets`].

@@ -8,8 +8,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use egui::{Color32, CornerRadius, RichText, WidgetInfo, WidgetType};
-use simplecut_core::retake::{self, Analysis, CutProposal, CutScope, Decision, MAX_DOCUMENT_BYTES};
-use simplecut_core::{AnalysisJob, AnalysisRequest, Analyzer, ItemId, JobState, Tick};
+use simplecut_core::retake::{self, Analysis, CutProposal, CutScope, Decision, MAX_DOCUMENT_BYTES, Presence};
+use simplecut_core::{AnalysisJob, AnalysisRequest, Analyzer, Editor, ItemId, JobState, Tick};
 
 use crate::app::{Action, SimpleCutApp, Source};
 use crate::{format, theme};
@@ -29,27 +29,33 @@ pub(crate) struct Running {
 pub(crate) struct Review {
     pub analyses: Vec<Analysis>,
     pub approved: HashSet<(ItemId, String)>,
+    pub seen_on: HashSet<(ItemId, String)>,
+    pub applied: HashSet<(ItemId, String)>,
 }
 
 impl Review {
-    fn new(analyses: Vec<Analysis>) -> Self {
-        let mut r = Self { analyses, approved: HashSet::new() };
-        r.approve_sure();
+    fn new(analyses: Vec<Analysis>, editor: &Editor) -> Self {
+        let mut seen_on = HashSet::new();
+        for a in &analyses {
+            for p in &a.proposals {
+                if editor.presence(a.item, p) == Presence::On {
+                    seen_on.insert((a.item, p.id.clone()));
+                }
+            }
+        }
+        let mut r = Self { analyses, approved: HashSet::new(), seen_on, applied: HashSet::new() };
+        r.approve_sure(editor);
         r
     }
 
-    fn approve_sure(&mut self) {
-        self.approved = self
-            .analyses
-            .iter()
-            .flat_map(|a| a.proposals.iter().map(move |p| (a.item, p)))
-            .filter(|(_, p)| p.decision == Decision::Remove && p.confidence >= AUTO_APPROVE)
-            .map(|(item, p)| (item, p.id.clone()))
-            .collect();
-    }
-
-    fn total(&self) -> usize {
-        self.analyses.iter().map(|a| a.proposals.len()).sum()
+    fn approve_sure(&mut self, editor: &Editor) {
+        for a in &self.analyses {
+            for p in &a.proposals {
+                if editor.presence(a.item, p) == Presence::On && p.decision == Decision::Remove && p.confidence >= AUTO_APPROVE {
+                    self.approved.insert((a.item, p.id.clone()));
+                }
+            }
+        }
     }
 
     fn rejected(&self) -> Vec<(String, String)> {
@@ -87,9 +93,22 @@ impl SimpleCutApp {
         self.retakes.running.is_some()
     }
 
-    /// (suggestions, approved) of the open review.
+    /// (suggestions, approved) of the open review, counting only suggestions currently On the timeline.
     pub fn review_summary(&self) -> Option<(usize, usize)> {
-        self.retakes.review.as_ref().map(|r| (r.total(), r.approved.len()))
+        let r = self.retakes.review.as_ref()?;
+        let mut total = 0;
+        let mut approved = 0;
+        for a in &r.analyses {
+            for p in &a.proposals {
+                if self.editor.presence(a.item, p) == Presence::On {
+                    total += 1;
+                    if r.approved.contains(&(a.item, p.id.clone())) {
+                        approved += 1;
+                    }
+                }
+            }
+        }
+        Some((total, approved))
     }
 
     /// Ids of the suggestions in the open review, in order.
@@ -112,8 +131,10 @@ impl SimpleCutApp {
         let mut out = Vec::new();
         for a in &r.analyses {
             for p in &a.proposals {
-                let approved = r.approved.contains(&(a.item, p.id.clone()));
-                out.extend(self.editor.timeline_ranges(a.item, p).into_iter().map(|(s, e)| (s, e, approved)));
+                if self.editor.presence(a.item, p) == Presence::On {
+                    let approved = r.approved.contains(&(a.item, p.id.clone()));
+                    out.extend(self.editor.timeline_ranges(a.item, p).into_iter().map(|(s, e)| (s, e, approved)));
+                }
             }
         }
         out
@@ -153,12 +174,18 @@ impl SimpleCutApp {
             }
             Action::ApproveSure => {
                 if let Some(r) = &mut self.retakes.review {
-                    r.approve_sure();
+                    r.approve_sure(&self.editor);
                 }
             }
             Action::ApproveNone => {
                 if let Some(r) = &mut self.retakes.review {
-                    r.approved.clear();
+                    for a in &r.analyses {
+                        for p in &a.proposals {
+                            if self.editor.presence(a.item, p) == Presence::On {
+                                r.approved.remove(&(a.item, p.id.clone()));
+                            }
+                        }
+                    }
                 }
             }
             Action::GoToProposal(item, id) => self.go_to_proposal(item, &id),
@@ -228,10 +255,31 @@ impl SimpleCutApp {
             self.info_text(format!("No retakes found.{extra}"));
             return;
         }
-        let review = Review::new(analyses);
+        let prev_applied = self.retakes.review.as_ref().map(|r| r.applied.clone()).unwrap_or_default();
+        let mut already_removed = 0;
+        for a in &analyses {
+            for p in &a.proposals {
+                if self.editor.presence(a.item, p) == Presence::Off {
+                    let is_removed = prev_applied.contains(&(a.item, p.id.clone())) || !self.editor.is_outside_used(a.item, p);
+                    if is_removed {
+                        already_removed += 1;
+                    }
+                }
+            }
+        }
+        let mut review = Review::new(analyses, &self.editor);
+        if let Some(prev) = &self.retakes.review {
+            for key in &prev.seen_on {
+                review.seen_on.insert(key.clone());
+            }
+            for key in &prev.applied {
+                review.applied.insert(key.clone());
+            }
+        }
         let approved = review.approved.len();
         self.retakes.review = Some(review);
-        self.info_text(format!("Found {found} possible retake{}; {approved} selected. Review them, then remove.", if found == 1 { "" } else { "s" }));
+        let extra = if already_removed > 0 { format!(" ({already_removed} already removed)") } else { String::new() };
+        self.info_text(format!("Found {found} possible retake{}{extra}; {approved} selected. Review them, then remove.", if found == 1 { "" } else { "s" }));
     }
 
     fn load_analysis(&mut self, path: PathBuf) {
@@ -270,19 +318,23 @@ impl SimpleCutApp {
         let sets: Vec<(ItemId, Vec<CutProposal>)> = review
             .analyses
             .iter()
-            .map(|a| (a.item, a.proposals.iter().filter(|p| review.approved.contains(&(a.item, p.id.clone()))).cloned().collect::<Vec<_>>()))
+            .map(|a| {
+                (
+                    a.item,
+                    a.proposals
+                        .iter()
+                        .filter(|p| self.editor.presence(a.item, p) == Presence::On && review.approved.contains(&(a.item, p.id.clone())))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
             .collect();
-        let applied: HashSet<(ItemId, String)> = review.approved.clone();
+        let applied_keys: Vec<(ItemId, String)> = sets.iter().flat_map(|(item, ps)| ps.iter().map(|p| (*item, p.id.clone()))).collect();
         match self.editor.apply_cut_sets(&sets, CutScope::MainTracks) {
             Ok(report) => {
                 if let Some(r) = &mut self.retakes.review {
-                    for a in &mut r.analyses {
-                        let item = a.item;
-                        a.proposals.retain(|p| !applied.contains(&(item, p.id.clone())));
-                    }
-                    r.approved.clear();
-                    if r.total() == 0 {
-                        self.retakes.review = None;
+                    for key in applied_keys {
+                        r.applied.insert(key);
                     }
                 }
                 self.source = Source::Timeline;
@@ -312,6 +364,7 @@ struct Row {
     removed: String,
     kept: String,
     approved: bool,
+    is_removed: bool,
     file: Option<String>,
 }
 
@@ -343,15 +396,29 @@ pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
         }
         return;
     }
+
+    if let Some(r) = &mut app.retakes.review {
+        for a in &r.analyses {
+            for p in &a.proposals {
+                if app.editor.presence(a.item, p) == Presence::On {
+                    r.seen_on.insert((a.item, p.id.clone()));
+                }
+            }
+        }
+    }
+
     let fps = app.editor.sequence().map_or(30.0, |s| s.fps);
     let many = app.retakes.review.as_ref().is_some_and(|r| r.analyses.len() > 1);
-    let (rows, ignored, total, approved): (Vec<Row>, Vec<(String, String)>, usize, usize) = match &app.retakes.review {
+    let (on_rows, off_rows, ignored): (Vec<Row>, Vec<Row>, Vec<(String, String)>) = match &app.retakes.review {
         Some(r) => {
-            let mut rows = Vec::new();
+            let mut on_rows = Vec::new();
+            let mut off_rows = Vec::new();
             for a in &r.analyses {
                 let file = many.then(|| app.editor.media_entry(a.item).map(|m| m.name)).flatten();
                 for p in &a.proposals {
-                    rows.push(Row {
+                    let on = app.editor.presence(a.item, p) == Presence::On;
+                    let is_removed = r.applied.contains(&(a.item, p.id.clone())) || !app.editor.is_outside_used(a.item, p);
+                    let row = Row {
                         item: a.item,
                         id: p.id.clone(),
                         start: p.start,
@@ -362,29 +429,42 @@ pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
                         removed: p.removed_text.clone(),
                         kept: p.kept_text.clone(),
                         approved: r.approved.contains(&(a.item, p.id.clone())),
+                        is_removed,
                         file: file.clone(),
-                    });
+                    };
+                    if on {
+                        on_rows.push(row);
+                    } else {
+                        off_rows.push(row);
+                    }
                 }
             }
-            (rows, r.rejected(), r.total(), r.approved.len())
+            (on_rows, off_rows, r.rejected())
         }
         None => return,
     };
 
-    ui.label(RichText::new(format!("{total} possible retake{} · {approved} selected", if total == 1 { "" } else { "s" })).color(t.text_dim));
-    ui.horizontal_wrapped(|ui| {
-        if ui.small_button("Select sure ones").on_hover_text("Select what the detector is at least 80 % sure about").clicked() {
-            app.queue(Action::ApproveSure);
-        }
-        if ui.small_button("Select none").clicked() {
-            app.queue(Action::ApproveNone);
-        }
-    });
+    let total = on_rows.len();
+    let approved = on_rows.iter().filter(|r| r.approved).count();
+
+    if total == 0 {
+        ui.label(RichText::new("Everything in this list is already removed. Ctrl+Z brings it back.").color(t.text_dim));
+    } else {
+        ui.label(RichText::new(format!("{total} possible retake{} · {approved} selected", if total == 1 { "" } else { "s" })).color(t.text_dim));
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Select sure ones").on_hover_text("Select what the detector is at least 80 % sure about").clicked() {
+                app.queue(Action::ApproveSure);
+            }
+            if ui.small_button("Select none").clicked() {
+                app.queue(Action::ApproveNone);
+            }
+        });
+    }
     ui.add_space(4.0);
 
     let list_height = (ui.available_height() - 64.0).max(80.0);
     egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
-        for row in &rows {
+        for row in &on_rows {
             egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
@@ -429,6 +509,44 @@ pub(crate) fn panel(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
             });
             ui.add_space(4.0);
         }
+
+        if !off_rows.is_empty() {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(RichText::new(format!("Already removed or not on the timeline ({})", off_rows.len())).color(t.text_dim))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for row in &off_rows {
+                        egui::Frame::new().fill(t.panel_raised).corner_radius(CornerRadius::same(6)).inner_margin(8).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let mut checked = row.approved;
+                                let label = format!("{} – {}", format::timecode(row.start, fps), format::timecode(row.end, fps));
+                                let r = ui.add_enabled(false, egui::Checkbox::new(&mut checked, RichText::new(label).color(t.text_dim)));
+                                r.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, false, row.approved, format!("Select suggestion {}", row.id)));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.label(RichText::new(format!("{:.0}%", row.confidence * 100.0)).color(t.text_dim));
+                                });
+                            });
+                            let status = if row.is_removed { "Already removed" } else { "Outside the part of the video you used" };
+                            ui.label(RichText::new(status).color(t.text_dim).small());
+                            if let Some(file) = &row.file {
+                                ui.label(RichText::new(file).color(t.text_dim).small());
+                            }
+                            if !row.reason.is_empty() {
+                                ui.label(RichText::new(&row.reason).color(t.text_dim).small());
+                            }
+                            if !row.removed.is_empty() {
+                                ui.label(RichText::new(format!("Cut: “{}”", shorten(&row.removed, 120))).color(t.text_dim).small());
+                            }
+                            if !row.kept.is_empty() {
+                                ui.label(RichText::new(format!("Keeps: “{}”", shorten(&row.kept, 120))).color(t.text_dim).small());
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                });
+        }
+
         if !ignored.is_empty() {
             ui.collapsing(format!("{} unusable suggestion{} ignored", ignored.len(), if ignored.len() == 1 { "" } else { "s" }), |ui| {
                 for (id, why) in &ignored {
