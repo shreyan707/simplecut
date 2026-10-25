@@ -65,6 +65,12 @@ pub(crate) struct TimelineUi {
     /// A track volume being dragged: only applied when the mouse is released.
     track_volume: Option<(TrackId, f64)>,
     clip_volume: Option<f64>,
+    /// Where the overview seek slider was drawn last frame (for tests).
+    pub seek_slider_rect: Option<egui::Rect>,
+    /// Whether playback was active before dragging the seek slider.
+    pub slider_was_playing: bool,
+    /// Last tick queued by the seek slider (to avoid duplicate seek actions).
+    pub slider_last_seek: Option<Tick>,
 }
 
 pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
@@ -73,6 +79,7 @@ pub(crate) fn show(app: &mut SimpleCutApp, ui: &mut egui::Ui) {
         ui.label("No project open.");
         return;
     };
+    seek_slider_row(app, ui, &seq);
     header_row(app, ui, &seq);
 
     let height = RULER_H + LANE_H * seq.tracks.len() as f32;
@@ -203,6 +210,79 @@ fn lane_color(kind: TrackKind, name: &str, t: &theme::Tokens) -> Color32 {
         (_, "Music") => t.music_clip,
         _ => t.dialogue_clip,
     }
+}
+
+// ── the overview seek slider ──────────────────────────────────────────────
+
+fn seek_slider_row(app: &mut SimpleCutApp, ui: &mut egui::Ui, seq: &SequenceView) {
+    let t = theme::tokens();
+    let is_empty = seq.tracks.iter().all(|t| t.clips.is_empty()) || seq.duration == Tick::ZERO;
+    let fps = seq.fps.max(1.0);
+    let cur_str = format::timecode(seq.playhead, fps);
+    let tot_str = format::timecode(seq.duration, fps);
+    let time_text = format!("{cur_str} / {tot_str}");
+
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(time_text).monospace().color(t.text_dim));
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let slider_w = ui.available_width().max(50.0);
+                ui.spacing_mut().slider_width = slider_w;
+
+                let max_ticks = seq.duration.0.max(1);
+                let mut current_ticks = seq.playhead.0.clamp(0, max_ticks);
+                let frame_ticks = tl_math::ticks(1.0 / fps).0.max(1);
+
+                let slider = egui::Slider::new(&mut current_ticks, 0..=max_ticks).step_by(frame_ticks as f64).show_value(false);
+
+                let r = ui.add_enabled(!is_empty, slider);
+                r.widget_info(|| WidgetInfo::labeled(WidgetType::Slider, true, "Timeline seek"));
+                app.tl.seek_slider_rect = Some(r.rect);
+
+                if r.drag_started() {
+                    app.tl.slider_was_playing = app.player.is_playing();
+                    if app.tl.slider_was_playing {
+                        app.player.pause();
+                    }
+                    app.tl.slider_last_seek = None;
+                }
+
+                let mut stepped = false;
+                if r.changed() {
+                    let new_tick = Tick(current_ticks);
+                    if app.tl.slider_last_seek != Some(new_tick) && new_tick != seq.playhead {
+                        app.queue(Action::SeekTimeline(new_tick));
+                        app.tl.slider_last_seek = Some(new_tick);
+                        stepped = true;
+                    }
+                }
+
+                if !stepped && r.has_focus() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                        let to = Tick((seq.playhead.0 - frame_ticks).max(0));
+                        if to != seq.playhead {
+                            app.queue(Action::SeekTimeline(to));
+                            app.tl.slider_last_seek = Some(to);
+                        }
+                    } else if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                        let to = Tick((seq.playhead.0 + frame_ticks).min(seq.duration.0));
+                        if to != seq.playhead {
+                            app.queue(Action::SeekTimeline(to));
+                            app.tl.slider_last_seek = Some(to);
+                        }
+                    }
+                }
+
+                if r.drag_stopped() {
+                    if app.tl.slider_was_playing {
+                        let _ = app.player.play(&mut app.editor);
+                        app.tl.slider_was_playing = false;
+                    }
+                    app.tl.slider_last_seek = None;
+                }
+            });
+        });
+    });
 }
 
 // ── the title row: clip volume and zoom ────────────────────────────────────

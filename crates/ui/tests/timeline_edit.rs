@@ -9,7 +9,7 @@ mod common;
 
 use common::harness::{Window, click, secs, skip, with_media};
 use egui::{Event, Modifiers, MouseWheelUnit, Pos2, Rect, vec2};
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use simplecut_core::{ClipId, ItemId, Lane, SequenceView, Tick, TrackView};
 use simplecut_ui::Action;
 
@@ -339,4 +339,77 @@ fn delete_removes_the_selected_clip_with_its_sound_and_closes_the_gap() {
     assert!(near(&spans(track(&v, "Dialogue")), &[(0, 4000)]));
     assert_eq!(spans(track(&v, "Music")), [(0, 6000)], "music stays where it was");
     assert_valid(&h);
+}
+
+#[test]
+fn seek_slider_overview_drags_follows_playback_and_handles_zoom_and_empty() {
+    if skip() {
+        return;
+    }
+    // 1. Disabled when empty
+    let mut h_empty = common::harness::window(common::harness::Script::default());
+    h_empty.step();
+    assert!(h_empty.get_by_label("Timeline seek").accesskit_node().is_disabled(), "seek slider is disabled on empty timeline");
+
+    // 2. Setup timeline with media
+    let (mut h, _) = two_clips();
+    let total_duration = seq(&h).duration;
+    assert!(total_duration > Tick::ZERO);
+    let slider_rect = h.state().seek_slider_rect().expect("seek slider drawn");
+
+    // 3. Drag to the middle -> playhead about half
+    let mid_x = slider_rect.center().x;
+    let mid_y = slider_rect.center().y;
+    drag(&mut h, Pos2::new(slider_rect.left() + 2.0, mid_y), Pos2::new(mid_x, mid_y));
+    let playhead = seq(&h).playhead;
+    let diff = (playhead.0 - total_duration.0 / 2).abs();
+    assert!(diff < total_duration.0 / 10, "drag to middle moves playhead to about half: got {playhead:?}, total {total_duration:?}");
+
+    // 4. No seek action when the value does not change
+    let before_playhead = seq(&h).playhead;
+    // Drag vertically at the same X
+    drag(&mut h, Pos2::new(mid_x, mid_y - 2.0), Pos2::new(mid_x, mid_y + 2.0));
+    assert_eq!(seq(&h).playhead, before_playhead, "no seek when value does not change");
+
+    // 5. Works while zoomed
+    h.state_mut().perform(Action::ZoomIn);
+    h.state_mut().perform(Action::ZoomIn);
+    h.step();
+    assert!(h.state().timeline_zoomed());
+    // Drag slider to 25% of slider width
+    let quarter_x = slider_rect.left() + slider_rect.width() * 0.25;
+    drag(&mut h, Pos2::new(mid_x, mid_y), Pos2::new(quarter_x, mid_y));
+    let playhead_zoomed = seq(&h).playhead;
+    let expected = total_duration.0 / 4;
+    let diff_zoomed = (playhead_zoomed.0 - expected).abs();
+    assert!(diff_zoomed < total_duration.0 / 10, "works while zoomed: got {playhead_zoomed:?}, expected ~{expected:?}");
+
+    // 6. Follows the playhead during playback
+    h.state_mut().perform(Action::SeekTimeline(Tick::ZERO));
+    h.state_mut().perform(Action::TogglePlay);
+    h.step();
+    for _ in 0..15 {
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let playing_playhead = seq(&h).playhead;
+    assert!(playing_playhead > Tick::ZERO, "playback advanced playhead");
+    let slider_node = h.get_by_label("Timeline seek");
+    if let Some(val) = slider_node.accesskit_node().numeric_value() {
+        let diff = (val - playing_playhead.0 as f64).abs();
+        assert!(diff < total_duration.0 as f64 / 10.0, "slider follows playhead during playback: slider {val}, playhead {playing_playhead:?}");
+    }
+
+    // 7. Arrow keys step one frame
+    h.state_mut().perform(Action::TogglePlay); // pause
+    h.step();
+    click(&mut h, "Timeline seek");
+    let before_arrow = seq(&h).playhead;
+    let frame = secs(1.0 / seq(&h).fps.max(1.0));
+    h.key_press(egui::Key::ArrowRight);
+    h.step();
+    assert_eq!(seq(&h).playhead, Tick(before_arrow.0 + frame.0), "arrow right steps one frame forward");
+    h.key_press(egui::Key::ArrowLeft);
+    h.step();
+    assert_eq!(seq(&h).playhead, before_arrow, "arrow left steps one frame backward");
 }

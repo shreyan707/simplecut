@@ -622,6 +622,11 @@ impl SimpleCutApp {
         self.tl.zoom.is_some()
     }
 
+    /// The screen rectangle of the overview seek slider as last drawn.
+    pub fn seek_slider_rect(&self) -> Option<egui::Rect> {
+        self.tl.seek_slider_rect
+    }
+
     fn import(&mut self, paths: Vec<PathBuf>) {
         let first_project_media = self.editor.media().is_empty();
         match self.editor.import(&paths) {
